@@ -7,7 +7,7 @@ LF몰 일반제휴 실적 대시보드 (Streamlit)
 설계 요약 (대화에서 확정된 사양)
 - 업로드 3종: ① 당해년도 실적  ② 전년도 인증 실적  ③ 전년도 거래 실적(분기, 복수 업로드 가능)
 - 분석 기준일: (1) 특정 일자 복수선택  (2) 기준일 MTD(월초~기준일)
-- 전년 동일자 매칭: 캘린더 동일 날짜 / 요일기준(52주 전) 중 선택
+- 전년 동일자 매칭: 캘린더 동일 날짜 / 요일기준(52주 전) / 전년 특정 일자 복수선택 중 선택
 - 모든 지표(UV·인증자수·거래액·고객수·객단가)의 모집단은 "선택 기간에 당월인증거래액이 발생한 제휴사"로 통일
 - SSNGCD03(배너성 AF코드) UV 제외 옵션
 - 총결제/순결제는 한 표에 섞지 않고 서브탭으로 분리하며, 표시 순서는 순결제 -> 총결제
@@ -75,17 +75,16 @@ def pct_ratio(cur, prev):
 
 
 def target_ratio(cur, target):
-    """목표비: 전년비와 같은 색상/기호(▼달성·초과 = 초록, △미달 = 빨강)를 쓰되,
-    표시값은 '증감률'이 아니라 실적/목표 그대로의 달성률(%)이다 (예: 95% 달성 -> "△95%").
-    목표가 아예 없으면(목표 파일에 해당 일자가 없으면) '-'로 표기한다."""
+    """목표비: 실적/목표 달성률(%) 그대로를 보여준다 (증감률 아님). 목표비는 절대 음수가
+    될 수 없으므로 전년비처럼 ▼/△ 두 기호를 쓰지 않고 항상 "▼"만 쓰되, 100% 이상(달성·초과)이면
+    초록, 100% 미만(미달)이면 빨강으로 색만 구분한다. 목표가 아예 없으면 '-'로 표기한다."""
     if (target is None or (isinstance(target, float) and pd.isna(target)) or target == 0
             or cur is None or (isinstance(cur, float) and pd.isna(cur))):
         return "-", "muted", None
     ratio = cur / target
     pct = round(ratio * 100)
-    if pct < 100:
-        return f"△{pct}%", "danger", ratio
-    return f"▼{pct}%", "success", ratio
+    color = "success" if pct >= 100 else "danger"
+    return f"▼{pct}%", color, ratio
 
 
 COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "accent": "#0969da"}
@@ -106,6 +105,66 @@ def style_delta_cols(df: pd.DataFrame, delta_cols: list | None = None):
     if delta_cols is None:
         return df.style.map(_color)
     return df.style.map(_color, subset=delta_cols)
+
+
+def style_with_color_grid(df: pd.DataFrame, color_grid: dict):
+    """목표비처럼 표시 기호(▼)만으로는 색상(달성=초록/미달=빨강)을 구분할 수 없는 컬럼용.
+    color_grid = {컬럼명: [이 컬럼의 행별 색상키('success'/'danger'/'accent'/None), ...]}.
+    지정 안 한 컬럼은 색을 입히지 않는다."""
+    def _apply(_df):
+        styles = pd.DataFrame("", index=_df.index, columns=_df.columns)
+        for col, keys in color_grid.items():
+            if col not in styles.columns:
+                continue
+            for i, key in enumerate(keys):
+                if key in ("success", "danger", "accent"):
+                    styles.iloc[i, styles.columns.get_loc(col)] = f"color:{COLOR_MAP[key]};font-weight:600"
+        return styles
+    return df.style.apply(_apply, axis=None)
+
+
+def render_grouped_table(header_groups: list, rows: list, color_rows: list | None = None, first_col_label: str = "일자"):
+    """일자별 탭처럼 '상위 카테고리(전체/신규/윈백/기존) + 하위 지표(실적/전년비/목표비)'를
+    2단 헤더로 묶어서 보여주는 HTML 표. 첫 컬럼(일자)은 1·2행을 세로 병합하고, 모든 셀은
+    가운데 정렬한다.
+    - header_groups: [(그룹명, [하위컬럼명, ...]), ...]
+    - rows: [[일자표시값, 값1, 값2, ...], ...] (값은 이미 fmt()된 문자열)
+    - color_rows: rows와 동일한 shape(첫 컬럼 제외)으로 각 셀의 색상키('success'/'danger'/'accent'/None)를
+      담은 리스트. None이면 색상 없이 렌더링.
+    """
+    ths_top = ['<th rowspan="2" style="text-align:center;vertical-align:middle;'
+               'border:1px solid #e1e4e8;padding:6px 10px;background:#f6f8fa;">'
+               f'{first_col_label}</th>']
+    for g, subs in header_groups:
+        ths_top.append(f'<th colspan="{len(subs)}" style="text-align:center;'
+                        f'border:1px solid #e1e4e8;padding:6px 10px;background:#f6f8fa;">{g}</th>')
+    ths_sub = []
+    for g, subs in header_groups:
+        for s in subs:
+            ths_sub.append(f'<th style="text-align:center;border:1px solid #e1e4e8;'
+                            f'padding:4px 10px;background:#fafbfc;font-weight:500;">{s}</th>')
+
+    body_rows = []
+    for ri, row in enumerate(rows):
+        cells = [f'<td style="text-align:center;border:1px solid #e1e4e8;'
+                 f'padding:4px 10px;white-space:nowrap;">{row[0]}</td>']
+        for ci, v in enumerate(row[1:]):
+            style = "text-align:center;border:1px solid #e1e4e8;padding:4px 10px;white-space:nowrap;"
+            if color_rows is not None:
+                key = color_rows[ri][ci]
+                if key in ("success", "danger", "accent"):
+                    style += f"color:{COLOR_MAP[key]};font-weight:600;"
+            cells.append(f'<td style="{style}">{v}</td>')
+        body_rows.append(f'<tr>{"".join(cells)}</tr>')
+
+    html = (
+        '<div style="overflow-x:auto;">'
+        '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+        f'<thead><tr>{"".join(ths_top)}</tr><tr>{"".join(ths_sub)}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody>'
+        '</table></div>'
+    )
+    return html
 
 
 EXCEL_PCT_FMT = '"▼"0%;[Red]"△"0%;0%'
@@ -178,8 +237,25 @@ if not sel_dates:
     st.stop()
 
 excl_ssng = st.sidebar.checkbox("SSNGCD03(삼성배너) UV 제외", value=False)
-yoy_mode_label = st.sidebar.radio("전년 동일자 매칭", ["캘린더 동일 날짜", "요일기준(52주 전)"], index=0)
-yoy_mode = "calendar" if yoy_mode_label == "캘린더 동일 날짜" else "weekday"
+yoy_mode_label = st.sidebar.radio(
+    "전년 동일자 매칭",
+    ["캘린더 동일 날짜", "요일기준(52주 전)", "전년 특정 일자 복수선택"],
+    index=0,
+)
+ly_manual_dates = None
+if yoy_mode_label == "전년 특정 일자 복수선택":
+    yoy_mode = "manual"
+    ly_candidates = A.ly_month_candidates(sel_dates)
+    _default_ly = [d for d in A.ly_dates(sel_dates, "calendar") if d in ly_candidates]
+    ly_manual_dates = st.sidebar.multiselect(
+        "전년도 비교 일자 선택 (해당 월 전체 중 복수선택 가능)",
+        options=ly_candidates, default=_default_ly,
+        format_func=lambda d: d.strftime("%Y-%m-%d"),
+    )
+    if not ly_manual_dates:
+        st.sidebar.caption("⚠ 전년도 비교 일자를 선택하지 않으면 전년비가 계산되지 않습니다.")
+else:
+    yoy_mode = "calendar" if yoy_mode_label == "캘린더 동일 날짜" else "weekday"
 exclude_af = "SSNGCD03" if excl_ssng else None
 
 # ----------------------------------------------------------------------------------
@@ -190,7 +266,7 @@ ly_amt_bytes = tuple(f.getvalue() for f in f_ly_amt) if f_ly_amt else tuple()
 ly_amt_data = _load_multi(ly_amt_bytes) if ly_amt_bytes else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
 target_df = _load_target_from_disk(TARGET_FILE)
 
-ly_all_dates = A.ly_dates(sel_dates, yoy_mode)
+ly_all_dates = ly_manual_dates if yoy_mode == "manual" else A.ly_dates(sel_dates, yoy_mode)
 
 # [주의] qual_partners(당월인증거래액>0인 제휴사)는 "제휴사별 실적" 탭에 어떤 제휴사를
 # 리스팅할지 정하는 기준일 뿐이다. UV/인증자수/거래액 등 다른 모든 탭의 집계는 이 리스트로
@@ -255,32 +331,40 @@ with tab_ov:
                 if not ly_amt_data["amt"].empty else {s: {"tot": None, "net": None, "cust_tot": None, "cust_net": None} for s in ["전체"] + A.STATUSES})
         cur_total = cur["전체"][pt]
         prev_total = prev["전체"][pt]
-        d_all, _, _ = pct_ratio(cur_total, prev_total)
+        d_all, d_all_color, _ = pct_ratio(cur_total, prev_total)
         show_target = pt == "net" and not target_df.empty
         group = "cert" if label == "당월인증" else "all"
-        header = f"**{title}**  \n### {fmt(cur_total)}  <span style='font-size:13px'>전년비 {d_all}</span>"
+        d_all_css = f"color:{COLOR_MAP.get(d_all_color, '#000')};font-weight:600" if d_all_color in COLOR_MAP else ""
+        header = (f"**{title}**  \n### {fmt(cur_total)}  "
+                  f"<span style='font-size:13px;{d_all_css}'>전년비 {d_all}</span>")
         if show_target:
             tgt_total = A.target_sum(target_df, sel_dates, group, "total")
-            t_all, _, _ = target_ratio(cur_total, tgt_total)
-            header += f"  <span style='font-size:13px'>목표비 {t_all}</span>"
+            t_all, t_all_color, _ = target_ratio(cur_total, tgt_total)
+            t_all_css = f"color:{COLOR_MAP.get(t_all_color, '#000')};font-weight:600" if t_all_color in COLOR_MAP else ""
+            header += f"  <span style='font-size:13px;{t_all_css}'>목표비 {t_all}</span>"
         st.markdown(header, unsafe_allow_html=True)
         rows = []
+        delta_colors, target_colors = [], []
         status_target_key = {"신규": "신규", "WIN-BACK": "윈백", "기존": "기존"}
         for k, lbl in [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]:
             c = cur[k][pt]
             p = prev[k][pt]
             share = f"{c / cur_total * 100:.1f}%" if cur_total else "-"
-            d, _, _ = pct_ratio(c, p)
+            d, d_color, _ = pct_ratio(c, p)
             row = [lbl, fmt(c), share, d]
+            delta_colors.append(d_color)
             if show_target:
                 tgt_v = A.target_sum(target_df, sel_dates, group, status_target_key[k])
-                t, _, _ = target_ratio(c, tgt_v)
+                t, t_color, _ = target_ratio(c, tgt_v)
                 row.append(t)
+                target_colors.append(t_color)
             rows.append(row)
         cols = ["구분", "기준일", "비중", "전년비"] + (["목표비"] if show_target else [])
-        delta_cols = ["전년비"] + (["목표비"] if show_target else [])
         df = pd.DataFrame(rows, columns=cols)
-        st.dataframe(style_delta_cols(df, delta_cols), hide_index=True, use_container_width=True)
+        color_grid = {"전년비": delta_colors}
+        if show_target:
+            color_grid["목표비"] = target_colors
+        st.dataframe(style_with_color_grid(df, color_grid), hide_index=True, use_container_width=True)
         return cur, prev
 
     cur_all, prev_all = _amt_block("전체", "전체거래액")
@@ -317,20 +401,21 @@ with tab_daily:
     st.dataframe(style_delta_cols(df_uv, ["전년비"]), hide_index=True, use_container_width=True)
 
     st.subheader("인증자수 (전체·신규·윈백·기존)")
-    cert_rows = []
+    cert_rows, cert_color_rows = [], []
     for i, d in enumerate(sorted(sel_dates)):
         r = daily_uc.iloc[i]
         pr = daily_uc_ly.iloc[i] if daily_uc_ly is not None and i < len(daily_uc_ly) else None
-        row = [d]
+        row = [d.strftime("%Y-%m-%d")]
+        color_row = []
         for col in ["인증_전체", "인증_신규", "인증_윈백", "인증_기존"]:
             pv = pr[col] if pr is not None else None
-            row += [fmt(r[col]), pct_ratio(r[col], pv)[0]]
+            d_disp, d_color, _ = pct_ratio(r[col], pv)
+            row += [fmt(r[col]), d_disp]
+            color_row += [None, d_color]
         cert_rows.append(row)
-    cert_cols = pd.MultiIndex.from_tuples(
-        [("", "일자")] + [t for s in ["전체", "신규", "윈백", "기존"] for t in [(s, "인증수"), (s, "전년비")]]
-    )
-    df_cert = pd.DataFrame(cert_rows, columns=cert_cols)
-    st.dataframe(style_delta_cols(df_cert), hide_index=True, use_container_width=True)
+        cert_color_rows.append(color_row)
+    cert_groups = [(s, ["인증수", "전년비"]) for s in ["전체", "신규", "윈백", "기존"]]
+    st.markdown(render_grouped_table(cert_groups, cert_rows, cert_color_rows), unsafe_allow_html=True)
 
     paytype_d = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="daily_paytype")
     ptd = "net" if paytype_d == "순결제" else "tot"
@@ -343,28 +428,28 @@ with tab_daily:
         show_target = ptd == "net" and not target_df.empty
         group = "cert" if cert_only else "all"
         status_target_key = {"전체": "total", "신규": "신규", "WIN-BACK": "윈백", "기존": "기존"}
-        rows = []
+        rows, color_rows = [], []
         for i in range(len(cur_d)):
             r = cur_d.iloc[i]
             pr = ly_d.iloc[i] if ly_d is not None and i < len(ly_d) else None
-            row = [r["일자"]]
+            row = [r["일자"].strftime("%Y-%m-%d")]
+            color_row = []
             for s in ["전체"] + A.STATUSES:
                 c = r[f"{s}_{ptd}"]
                 p = pr[f"{s}_{ptd}"] if pr is not None else None
-                row += [fmt(c), pct_ratio(c, p)[0]]
+                d_disp, d_color, _ = pct_ratio(c, p)
+                row += [fmt(c), d_disp]
+                color_row += [None, d_color]
                 if show_target:
                     tgt_v = A.target_lookup(target_df, r["일자"], group, status_target_key[s])
-                    t, _, _ = target_ratio(c, tgt_v)
-                    row.append(t)
+                    t_disp, t_color, _ = target_ratio(c, tgt_v)
+                    row.append(t_disp)
+                    color_row.append(t_color)
             rows.append(row)
-        col_tuples = [("", "일자")]
-        for s in ["전체", "신규", "윈백", "기존"]:
-            col_tuples.append((s, "실적"))
-            col_tuples.append((s, "전년비"))
-            if show_target:
-                col_tuples.append((s, "목표비"))
-        df = pd.DataFrame(rows, columns=pd.MultiIndex.from_tuples(col_tuples))
-        st.dataframe(style_delta_cols(df), hide_index=True, use_container_width=True)
+            color_rows.append(color_row)
+        subcols = ["실적", "전년비"] + (["목표비"] if show_target else [])
+        groups = [(s, subcols) for s in ["전체", "신규", "윈백", "기존"]]
+        st.markdown(render_grouped_table(groups, rows, color_rows), unsafe_allow_html=True)
         return cur_d, ly_d
 
     all_cur_d, all_ly_d = _daily_amt_block(False, "전체거래액")
