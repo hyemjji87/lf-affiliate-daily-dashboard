@@ -1,0 +1,296 @@
+"""
+LF몰 일반제휴 실적 분석 - 데이터 로딩 & 집계 로직 (Streamlit 비의존 모듈)
+
+업로드 3종 파일(당해년도 실적 / 전년도 인증 실적 / 전년도 거래 실적(분기, 복수))을
+시트 "이름"이 아니라 "컬럼 구성"으로 자동 분류해서 로딩한다 (파일명/시트명이 달라져도 안전).
+
+모든 지표(UV·인증자수·거래액·고객수·객단가)는 "선택한 기간에 당월인증거래액이 발생한 제휴사"로
+모집단을 통일해서 계산한다 (요청 반영: 제휴 구분(일반/빅제휴)이 아니라 제휴사(AB열) 기준, 당월인증
+거래액 발생 여부로 스코프를 정함).
+"""
+from __future__ import annotations
+import io
+import datetime as dt
+
+import pandas as pd
+import numpy as np
+
+try:
+    from python_calamine import CalamineWorkbook
+    _HAVE_CALAMINE = True
+except Exception:  # pragma: no cover - calamine 미설치 환경 대비
+    import openpyxl
+    _HAVE_CALAMINE = False
+
+STATUSES = ["신규", "WIN-BACK", "기존"]  # 표기: 신규 / 윈백 / 기존
+
+
+# --------------------------------------------------------------------------------------
+# 1) 시트 자동 분류 & 로딩
+#    인증거래액류 시트는 5만~15만 행까지 커질 수 있어 python-calamine(러스트 기반, openpyxl 대비
+#    5~8배 빠름)을 우선 사용하고, 설치가 안 된 환경에서는 openpyxl read_only로 대체한다.
+# --------------------------------------------------------------------------------------
+def _to_date(series: pd.Series) -> pd.Series:
+    """정산일시일/인증일시일/★일자일 컬럼은 파일마다 datetime 또는 문자열로 섞여 들어옴 -> date로 통일."""
+    return pd.to_datetime(series.astype(str).str.slice(0, 10), errors="coerce")
+
+
+def _read_all_sheets(file_bytes: bytes) -> dict:
+    """워크북의 모든 시트를 {시트명: [[row], ...]} (첫 행=헤더) 형태로 읽어온다."""
+    if _HAVE_CALAMINE:
+        wb = CalamineWorkbook.from_filelike(io.BytesIO(file_bytes))
+        return {sn: wb.get_sheet_by_name(sn).to_python() for sn in wb.sheet_names}
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    return {sn: [list(r) for r in wb[sn].iter_rows(values_only=True)] for sn in wb.sheetnames}
+
+
+def classify_workbook(file_bytes: bytes) -> dict:
+    """워크북 안의 시트를 컬럼 구성으로 분류해서 amt/uv/cert/pivot 프레임으로 반환."""
+    sheets = _read_all_sheets(file_bytes)
+    amt_frames, uv_frames, cert_frames = [], [], []
+    pivot_df = None
+    for sn, data in sheets.items():
+        if not data:
+            continue
+        if "피벗" in sn:
+            try:
+                pivot_df = pd.DataFrame(data)
+            except Exception:
+                pass
+            continue
+        header = data[0]
+        cols = set(map(str, header))
+        ncol = len(header)
+        body = [r[:ncol] for r in data[1:] if r and r[0] is not None]
+        if not body:
+            continue
+        df = pd.DataFrame(body, columns=header)
+        if "거래액_VAT제외" in cols and "정산구분" in cols:
+            amt_frames.append(df)
+        elif "★UV" in cols:
+            uv_frames.append(df)
+        elif "총합계" in cols and ("제휴처구분1" in cols or "제휴처구분3" in cols):
+            cert_frames.append(df)
+    amt = pd.concat(amt_frames, ignore_index=True) if amt_frames else pd.DataFrame()
+    uv = pd.concat(uv_frames, ignore_index=True) if uv_frames else pd.DataFrame()
+    cert = pd.concat(cert_frames, ignore_index=True) if cert_frames else pd.DataFrame()
+
+    if not amt.empty:
+        amt["정산일시일"] = _to_date(amt["정산일시일"])
+        amt["거래액_VAT제외"] = pd.to_numeric(amt["거래액_VAT제외"], errors="coerce").fillna(0)
+        amt["제휴사"] = amt["제휴사"].astype(str)
+        amt.loc[amt["제휴사"].isin(["nan", "None", ""]), "제휴사"] = np.nan
+    if not uv.empty:
+        uv["★일자일"] = _to_date(uv["★일자일"])
+        uv["★UV"] = pd.to_numeric(uv["★UV"], errors="coerce").fillna(0)
+    if not cert.empty:
+        cert["인증일시일"] = _to_date(cert["인증일시일"])
+        for c in ["총합계", "기존", "WIN-BACK", "신규"]:
+            if c in cert.columns:
+                cert[c] = pd.to_numeric(cert[c], errors="coerce").fillna(0)
+
+    return {"amt": amt, "uv": uv, "cert": cert, "pivot": pivot_df}
+
+
+def merge_workbooks(list_of_bytes: list) -> dict:
+    """전년도 거래 실적처럼 분기별로 여러 파일이 올라오는 경우 합쳐서 하나의 dict로 반환."""
+    amt_all, uv_all, cert_all, pivot = [], [], [], None
+    for b in list_of_bytes:
+        d = classify_workbook(b)
+        if not d["amt"].empty:
+            amt_all.append(d["amt"])
+        if not d["uv"].empty:
+            uv_all.append(d["uv"])
+        if not d["cert"].empty:
+            cert_all.append(d["cert"])
+        if pivot is None and d["pivot"] is not None:
+            pivot = d["pivot"]
+    return {
+        "amt": pd.concat(amt_all, ignore_index=True) if amt_all else pd.DataFrame(),
+        "uv": pd.concat(uv_all, ignore_index=True) if uv_all else pd.DataFrame(),
+        "cert": pd.concat(cert_all, ignore_index=True) if cert_all else pd.DataFrame(),
+        "pivot": pivot,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# 2) 날짜 유틸: 전년 동일자 매핑 (캘린더 동일 날짜 / 요일기준 52주 전)
+# --------------------------------------------------------------------------------------
+def ly_date(d: dt.date, mode: str = "calendar") -> dt.date:
+    if mode == "calendar":
+        try:
+            return d.replace(year=d.year - 1)
+        except ValueError:  # 2/29 처리
+            return d.replace(year=d.year - 1, day=28)
+    return d - dt.timedelta(weeks=52)  # weekday 모드: 정확히 52주 전 -> 요일 동일
+
+
+def ly_dates(dates: list, mode: str = "calendar") -> list:
+    return [ly_date(d, mode) for d in dates]
+
+
+# --------------------------------------------------------------------------------------
+# 3) 모집단(scope): 선택 기간에 당월인증거래액이 발생한 제휴사만
+# --------------------------------------------------------------------------------------
+def qualifying_partners(amt_df: pd.DataFrame, dates: list) -> list:
+    if amt_df.empty:
+        return []
+    sub = amt_df[amt_df["정산일시일"].dt.date.isin(dates) & (amt_df["당월인증"] == "Y")]
+    names = [p for p in sub["제휴사"].dropna().unique().tolist() if p and p != "nan"]
+    return sorted(names)
+
+
+# --------------------------------------------------------------------------------------
+# 4) 집계 함수
+# --------------------------------------------------------------------------------------
+def _filter_amt(amt_df, dates, partners, cert_only=False):
+    if amt_df.empty:
+        return amt_df
+    sub = amt_df[amt_df["정산일시일"].dt.date.isin(dates) & amt_df["제휴사"].isin(partners)]
+    if cert_only:
+        sub = sub[sub["당월인증"] == "Y"]
+    return sub
+
+
+def amt_summary(amt_df, dates, partners, cert_only=False) -> dict:
+    """구분(전체/신규/윈백/기존)별 총결제·순결제 거래액/고객수."""
+    sub = _filter_amt(amt_df, dates, partners, cert_only)
+    statuses = ["전체"] + STATUSES
+    if sub.empty:
+        return {s: {"tot": 0, "net": 0, "cust_tot": 0, "cust_net": 0} for s in statuses}
+    out = {}
+    for s in statuses:
+        g = sub if s == "전체" else sub[sub["기존/win-back/신규"] == s]
+        sale = g[g["정산구분"] == "판매"]
+        out[s] = {
+            "tot": float(sale["거래액_VAT제외"].sum()),
+            "net": float(g["거래액_VAT제외"].sum()),
+            "cust_tot": int(sale["고객번호"].nunique()),
+            "cust_net": int(g["고객번호"].nunique()),
+        }
+    return out
+
+
+def uv_total(uv_df, dates, partners, exclude_af=None, name_col="제휴사명") -> int:
+    if uv_df.empty:
+        return 0
+    sub = uv_df[uv_df["★일자일"].dt.date.isin(dates) & uv_df[name_col].isin(partners)]
+    if exclude_af:
+        sub = sub[sub["AF코드"] != exclude_af]
+    return int(sub["★UV"].sum())
+
+
+def cert_summary(cert_df, dates, partners, name_col="제휴사") -> dict:
+    if cert_df.empty:
+        return {"전체": 0, "기존": 0, "WIN-BACK": 0, "신규": 0}
+    sub = cert_df[cert_df["인증일시일"].dt.date.isin(dates) & cert_df[name_col].isin(partners)]
+    return {
+        "전체": int(sub["총합계"].sum()),
+        "기존": int(sub["기존"].sum()),
+        "WIN-BACK": int(sub["WIN-BACK"].sum()),
+        "신규": int(sub["신규"].sum()),
+    }
+
+
+def daily_amt_table(amt_df, dates, partners, cert_only=False) -> pd.DataFrame:
+    """일자 x 구분(전체/신규/윈백/기존) 별 총결제/순결제 거래액·고객수 - 일자별 탭용."""
+    sub = _filter_amt(amt_df, dates, partners, cert_only)
+    dates_sorted = sorted(dates)
+    if sub.empty:
+        return pd.DataFrame({"일자": dates_sorted})
+    sale = sub[sub["정산구분"] == "판매"]
+    g_tot = sale.groupby(["정산일시일", "기존/win-back/신규"])["거래액_VAT제외"].sum()
+    g_net = sub.groupby(["정산일시일", "기존/win-back/신규"])["거래액_VAT제외"].sum()
+    all_tot = sale.groupby("정산일시일")["거래액_VAT제외"].sum()
+    all_net = sub.groupby("정산일시일")["거래액_VAT제외"].sum()
+    allc_tot = sale.groupby("정산일시일")["고객번호"].nunique()
+    allc_net = sub.groupby("정산일시일")["고객번호"].nunique()
+    rows = []
+    for d in dates_sorted:
+        ts = pd.Timestamp(d)
+        row = {
+            "일자": d,
+            "전체_tot": float(all_tot.get(ts, 0)), "전체_net": float(all_net.get(ts, 0)),
+            "전체_cust_tot": int(allc_tot.get(ts, 0)), "전체_cust_net": int(allc_net.get(ts, 0)),
+        }
+        for s in STATUSES:
+            row[f"{s}_tot"] = float(g_tot.get((ts, s), 0))
+            row[f"{s}_net"] = float(g_net.get((ts, s), 0))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def daily_uv_cert_table(uv_df, cert_df, dates, partners, exclude_af=None) -> pd.DataFrame:
+    dates_sorted = sorted(dates)
+    uv_by_day = {}
+    if not uv_df.empty:
+        sub = uv_df[uv_df["★일자일"].dt.date.isin(dates) & uv_df["제휴사명"].isin(partners)]
+        if exclude_af:
+            sub = sub[sub["AF코드"] != exclude_af]
+        uv_by_day = sub.groupby(sub["★일자일"].dt.date)["★UV"].sum().to_dict()
+    cert_g = {}
+    if not cert_df.empty:
+        sub = cert_df[cert_df["인증일시일"].dt.date.isin(dates) & cert_df["제휴사"].isin(partners)]
+        for col in ["총합계", "기존", "WIN-BACK", "신규"]:
+            cert_g[col] = sub.groupby(sub["인증일시일"].dt.date)[col].sum().to_dict()
+    rows = []
+    for d in dates_sorted:
+        rows.append({
+            "일자": d,
+            "UV": int(uv_by_day.get(d, 0)),
+            "인증_전체": int(cert_g.get("총합계", {}).get(d, 0)),
+            "인증_신규": int(cert_g.get("신규", {}).get(d, 0)),
+            "인증_윈백": int(cert_g.get("WIN-BACK", {}).get(d, 0)),
+            "인증_기존": int(cert_g.get("기존", {}).get(d, 0)),
+        })
+    return pd.DataFrame(rows)
+
+
+def group_amt_table(amt_df, dates, partners, groupcol, cert_only=False) -> pd.DataFrame:
+    """카테고리/브랜드/제휴사 등 임의 그룹컬럼 기준 총결제/순결제 거래액 집계."""
+    sub = _filter_amt(amt_df, dates, partners, cert_only)
+    if sub.empty:
+        return pd.DataFrame(columns=[groupcol, "tot", "net"])
+    sale = sub[sub["정산구분"] == "판매"]
+    tot = sale.groupby(groupcol)["거래액_VAT제외"].sum()
+    net = sub.groupby(groupcol)["거래액_VAT제외"].sum()
+    return pd.DataFrame({"tot": tot, "net": net}).reset_index()
+
+
+def partner_full_table(amt_df, uv_df, cert_df, dates, partners, exclude_af=None) -> pd.DataFrame:
+    """제휴사별 실적 탭 - UV/인증수/당월인증거래액/전체거래액/고객수/객단가 원본 테이블."""
+    cert_amt = group_amt_table(amt_df, dates, partners, "제휴사", cert_only=True).rename(
+        columns={"tot": "cert_tot", "net": "cert_net"})
+    all_amt = group_amt_table(amt_df, dates, partners, "제휴사", cert_only=False).rename(
+        columns={"tot": "all_tot", "net": "all_net"})
+    merged = pd.merge(cert_amt, all_amt, on="제휴사", how="outer").fillna(0)
+
+    sub = _filter_amt(amt_df, dates, partners, cert_only=False)
+    if not sub.empty:
+        sale = sub[sub["정산구분"] == "판매"]
+        cust_tot = sale.groupby("제휴사")["고객번호"].nunique()
+        cust_net = sub.groupby("제휴사")["고객번호"].nunique()
+        merged["cust_tot"] = merged["제휴사"].map(cust_tot).fillna(0).astype(int)
+        merged["cust_net"] = merged["제휴사"].map(cust_net).fillna(0).astype(int)
+    else:
+        merged["cust_tot"] = 0
+        merged["cust_net"] = 0
+
+    uv_map, cert_map = {}, {}
+    for p in partners:
+        uv_map[p] = uv_total(uv_df, dates, [p], exclude_af=exclude_af)
+        cert_map[p] = cert_summary(cert_df, dates, [p])["전체"]
+    merged["UV"] = merged["제휴사"].map(uv_map)
+    merged["인증수"] = merged["제휴사"].map(cert_map)
+    return merged.sort_values("cert_tot", ascending=False).reset_index(drop=True)
+
+
+def partner_daily_table(amt_df, uv_df, cert_df, dates, partner, exclude_af=None) -> pd.DataFrame:
+    d = daily_amt_table(amt_df, dates, [partner], cert_only=False)
+    dc = daily_amt_table(amt_df, dates, [partner], cert_only=True)
+    uc = daily_uv_cert_table(uv_df, cert_df, dates, [partner], exclude_af=exclude_af)
+    out = uc.merge(d[["일자", "전체_tot", "전체_net", "전체_cust_tot", "전체_cust_net"]], on="일자", how="left")
+    out = out.merge(dc[["일자", "전체_tot", "전체_net"]].rename(
+        columns={"전체_tot": "당월인증_tot", "전체_net": "당월인증_net"}), on="일자", how="left")
+    return out.rename(columns={"전체_tot": "전체거래액_tot", "전체_net": "전체거래액_net",
+                                "전체_cust_tot": "고객수_tot", "전체_cust_net": "고객수_net"})

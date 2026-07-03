@@ -1,0 +1,487 @@
+"""
+LF몰 일반제휴 실적 대시보드 (Streamlit)
+
+실행:  streamlit run app.py
+필요 패키지: requirements.txt 참고
+
+설계 요약 (대화에서 확정된 사양)
+- 업로드 3종: ① 당해년도 실적  ② 전년도 인증 실적  ③ 전년도 거래 실적(분기, 복수 업로드 가능)
+- 분석 기준일: (1) 특정 일자 복수선택  (2) 기준일 MTD(월초~기준일)
+- 전년 동일자 매칭: 캘린더 동일 날짜 / 요일기준(52주 전) 중 선택
+- 모든 지표(UV·인증자수·거래액·고객수·객단가)의 모집단은 "선택 기간에 당월인증거래액이 발생한 제휴사"로 통일
+- SSNGCD03(배너성 AF코드) UV 제외 옵션
+- 총결제/순결제는 한 표에 섞지 않고 서브탭으로 분리하며, 표시 순서는 순결제 -> 총결제
+- 전년비 표기: 상승 "▼", 하락 "△"(빨강) - 특정 회사 내부 컨벤션이라 이 순서를 그대로 사용
+- 화면에는 전년비(%)만 표기하고, 전년도 원본 값은 엑셀 다운로드에만 포함
+- 신규/윈백/기존 구분은 카테고리·브랜드 탭을 제외한 모든 탭에 적용
+"""
+import io
+import datetime as dt
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import lf_analysis as A
+
+st.set_page_config(page_title="LF몰 일반제휴 실적", page_icon="📊", layout="wide")
+
+# ----------------------------------------------------------------------------------
+# 캐싱된 로더 (같은 파일이면 재계산하지 않음)
+# ----------------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _load_single(file_bytes: bytes) -> dict:
+    return A.classify_workbook(file_bytes)
+
+
+@st.cache_data(show_spinner=False)
+def _load_multi(list_of_bytes: tuple) -> dict:
+    return A.merge_workbooks(list(list_of_bytes))
+
+
+# ----------------------------------------------------------------------------------
+# 포맷 유틸
+# ----------------------------------------------------------------------------------
+def fmt(n):
+    if n is None or (isinstance(n, float) and pd.isna(n)):
+        return "-"
+    return f"{round(n):,}"
+
+
+def pct_ratio(cur, prev):
+    """엑셀/화면 공통으로 쓸 (표시문자열, 색상, 원시비율) 반환."""
+    if prev is None or prev == 0 or pd.isna(prev) or cur is None or pd.isna(cur):
+        if prev is None or (isinstance(prev, float) and pd.isna(prev)):
+            return "신규", "accent", None
+        return "-", "muted", None
+    ratio = cur / prev - 1
+    pct = round(ratio * 100)
+    if pct < 0:
+        return f"△{abs(pct)}%", "danger", ratio
+    return f"▼{pct}%", "success", ratio
+
+
+COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "accent": "#0969da"}
+
+
+def style_delta_cols(df: pd.DataFrame, delta_cols: list):
+    """Δ로 표기된 컬럼(문자열: '▼12%' / '△5%' / '신규' / '-')에 색을 입힌 Styler 반환."""
+    def _color(v):
+        if isinstance(v, str) and v.startswith("▼"):
+            return f"color:{COLOR_MAP['success']};font-weight:600"
+        if isinstance(v, str) and v.startswith("△"):
+            return f"color:{COLOR_MAP['danger']};font-weight:600"
+        if v == "신규":
+            return f"color:{COLOR_MAP['accent']};font-weight:600"
+        return ""
+    return df.style.map(_color, subset=delta_cols)
+
+
+EXCEL_PCT_FMT = '"▼"0%;[Red]"△"0%;0%'
+
+
+def to_excel_bytes(sheets: dict, pct_cols_by_sheet: dict | None = None) -> bytes:
+    """{시트명: DataFrame} -> xlsx 바이트. pct_cols_by_sheet={'시트명':[컬럼명,...]} 이면
+    해당 컬럼에 회사 컨벤션 숫자서식('▼0%;[빨강]△0%')을 적용한다(원시 비율 값이 들어있어야 함)."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe_name = name[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+            ws = writer.sheets[safe_name]
+            if pct_cols_by_sheet and name in pct_cols_by_sheet:
+                for col in pct_cols_by_sheet[name]:
+                    if col in df.columns:
+                        col_idx = df.columns.get_loc(col) + 1  # 1-based
+                        col_letter = ws.cell(row=1, column=col_idx).column_letter
+                        for r in range(2, len(df) + 2):
+                            ws[f"{col_letter}{r}"].number_format = EXCEL_PCT_FMT
+    return buf.getvalue()
+
+
+# ----------------------------------------------------------------------------------
+# 사이드바: 파일 업로드 & 분석 설정
+# ----------------------------------------------------------------------------------
+st.sidebar.header("📁 Step 1. 파일 업로드")
+f_cur = st.sidebar.file_uploader("① 당해년도 실적", type=["xlsx"], key="f_cur")
+f_ly_cert = st.sidebar.file_uploader("② 전년도 인증 실적", type=["xlsx"], key="f_ly_cert")
+f_ly_amt = st.sidebar.file_uploader(
+    "③ 전년도 거래 실적 (분기별, 여러 파일 업로드 가능)",
+    type=["xlsx"], accept_multiple_files=True, key="f_ly_amt",
+)
+
+st.sidebar.divider()
+st.sidebar.header("⚙ Step 2. 분석 설정")
+
+if f_cur is None:
+    st.sidebar.info("① 당해년도 실적 파일을 올리면 분석 설정이 열립니다.")
+    st.title("📊 LF몰 일반제휴 실적")
+    st.info("왼쪽 사이드바에서 ① 당해년도 실적 파일을 먼저 업로드해 주세요.")
+    st.stop()
+
+cur_data = _load_single(f_cur.getvalue())
+if cur_data["amt"].empty:
+    st.error("업로드한 파일에서 '인증거래액' 형태의 시트를 찾지 못했습니다. 파일을 확인해 주세요.")
+    st.stop()
+
+available_dates = sorted(cur_data["amt"]["정산일시일"].dropna().dt.date.unique().tolist())
+min_d, max_d = available_dates[0], available_dates[-1]
+
+mode = st.sidebar.radio("분석 기준일", ["특정 일자 복수선택", "기준일 MTD"], index=1)
+
+if mode == "특정 일자 복수선택":
+    sel_dates = st.sidebar.multiselect(
+        "날짜 선택 (드롭다운, 여러 개 선택 가능)",
+        options=available_dates, default=available_dates,
+        format_func=lambda d: d.strftime("%Y-%m-%d"),
+    )
+else:
+    base_date = st.sidebar.date_input(
+        "MTD 마감일", value=max_d, min_value=min_d, max_value=max_d,
+    )
+    month_start = base_date.replace(day=1)
+    sel_dates = [d for d in available_dates if month_start <= d <= base_date]
+
+if not sel_dates:
+    st.warning("분석할 날짜를 하나 이상 선택해 주세요.")
+    st.stop()
+
+excl_ssng = st.sidebar.checkbox("SSNGCD03(삼성배너) UV 제외", value=False)
+yoy_mode_label = st.sidebar.radio("전년 동일자 매칭", ["캘린더 동일 날짜", "요일기준(52주 전)"], index=0)
+yoy_mode = "calendar" if yoy_mode_label == "캘린더 동일 날짜" else "weekday"
+exclude_af = "SSNGCD03" if excl_ssng else None
+
+# ----------------------------------------------------------------------------------
+# 전년도 데이터 로딩 (선택사항 - 없으면 전년비는 "-"로 표기)
+# ----------------------------------------------------------------------------------
+ly_cert_data = _load_single(f_ly_cert.getvalue()) if f_ly_cert else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
+ly_amt_bytes = tuple(f.getvalue() for f in f_ly_amt) if f_ly_amt else tuple()
+ly_amt_data = _load_multi(ly_amt_bytes) if ly_amt_bytes else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
+
+ly_all_dates = A.ly_dates(sel_dates, yoy_mode)
+
+# 모집단: 당월인증거래액이 발생한 제휴사 (당해년도 기준)
+partners = A.qualifying_partners(cur_data["amt"], sel_dates)
+ly_partners = A.qualifying_partners(ly_amt_data["amt"], ly_all_dates) if not ly_amt_data["amt"].empty else partners
+
+if not partners:
+    st.warning("선택한 기간에 당월인증거래액이 발생한 제휴사가 없습니다. 날짜 선택을 확인해 주세요.")
+    st.stop()
+
+# ----------------------------------------------------------------------------------
+# 헤더
+# ----------------------------------------------------------------------------------
+warn_bits = []
+if f_ly_cert is None:
+    warn_bits.append("전년도 인증 실적 미업로드(UV·인증자수 전년비 불가)")
+if not f_ly_amt:
+    warn_bits.append("전년도 거래 실적 미업로드(거래액 전년비 불가)")
+
+st.title("📊 LF몰 일반제휴 실적")
+period_txt = f"{sel_dates[0]:%Y-%m-%d} ~ {sel_dates[-1]:%Y-%m-%d}" if len(sel_dates) > 1 else f"{sel_dates[0]:%Y-%m-%d}"
+st.caption(
+    f"분석기간 {period_txt} · 대상 제휴사 {len(partners)}개(당월인증거래액 발생 기준) · "
+    f"전년 매칭: {yoy_mode_label}" + ("" if not warn_bits else " · ⚠ " + " / ".join(warn_bits))
+)
+
+json_col, _ = st.columns([1, 5])
+with json_col:
+    pass  # JSON 내보내기 버튼은 각 탭 하단에서 개별 제공 (탭별 데이터가 다르므로)
+
+tab_ov, tab_daily, tab_partner, tab_cat, tab_brand = st.tabs(
+    ["개요", "일자별", "제휴사별 실적", "카테고리별 실적", "브랜드별 실적"]
+)
+
+# ====================================================================================
+# 개요 탭
+# ====================================================================================
+with tab_ov:
+    uv_cur = A.uv_total(cur_data["uv"], sel_dates, partners, exclude_af=exclude_af)
+    uv_prev = A.uv_total(ly_cert_data["uv"], ly_all_dates, ly_partners) if not ly_cert_data["uv"].empty else None
+    cert_cur = A.cert_summary(cur_data["cert"], sel_dates, partners)
+    cert_prev = A.cert_summary(ly_cert_data["cert"], ly_all_dates, ly_partners) if not ly_cert_data["cert"].empty else {"전체": None, "기존": None, "WIN-BACK": None, "신규": None}
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("UV", fmt(uv_cur), pct_ratio(uv_cur, uv_prev)[0])
+    with c2:
+        st.metric("인증자수", fmt(cert_cur["전체"]), pct_ratio(cert_cur["전체"], cert_prev["전체"])[0])
+
+    st.subheader("인증자수 구성 (비중은 기준일 기준)")
+    rows = []
+    for k, label in [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]:
+        share = f"{cert_cur[k] / cert_cur['전체'] * 100:.1f}%" if cert_cur["전체"] else "-"
+        d, _, _ = pct_ratio(cert_cur[k], cert_prev.get(k))
+        rows.append([label, fmt(cert_cur[k]), share, d])
+    df_certcomp = pd.DataFrame(rows, columns=["구분", "기준일", "비중", "전년비"])
+    st.dataframe(style_delta_cols(df_certcomp, ["전년비"]), hide_index=True, use_container_width=True)
+
+    paytype = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="ov_paytype")
+    pt = "net" if paytype == "순결제" else "tot"
+
+    def _amt_block(label, title):
+        cur = A.amt_summary(cur_data["amt"], sel_dates, partners, cert_only=(label == "당월인증"))
+        prev = (A.amt_summary(ly_amt_data["amt"], ly_all_dates, ly_partners, cert_only=(label == "당월인증"))
+                if not ly_amt_data["amt"].empty else {s: {"tot": None, "net": None, "cust_tot": None, "cust_net": None} for s in ["전체"] + A.STATUSES})
+        cur_total = cur["전체"][pt]
+        prev_total = prev["전체"][pt]
+        d_all, _, _ = pct_ratio(cur_total, prev_total)
+        st.markdown(f"**{title}**  \n### {fmt(cur_total)}  <span style='font-size:13px'>전년비 {d_all}</span>", unsafe_allow_html=True)
+        rows = []
+        for k, lbl in [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]:
+            c = cur[k][pt]
+            p = prev[k][pt]
+            share = f"{c / cur_total * 100:.1f}%" if cur_total else "-"
+            d, _, _ = pct_ratio(c, p)
+            rows.append([lbl, fmt(c), share, d])
+        df = pd.DataFrame(rows, columns=["구분", "기준일", "비중", "전년비"])
+        st.dataframe(style_delta_cols(df, ["전년비"]), hide_index=True, use_container_width=True)
+        return cur, prev
+
+    cur_all, prev_all = _amt_block("전체", "전체거래액")
+    cur_cert, prev_cert = _amt_block("당월인증", "당월인증거래액")
+
+    def _cust_aov_table(cur, prev, title):
+        st.subheader(title)
+        cust_c, cust_p = cur["전체"][f"cust_{pt}"], prev["전체"][f"cust_{pt}"]
+        aov_c = cur["전체"][pt] / cust_c if cust_c else 0
+        aov_p = (prev["전체"][pt] / cust_p) if cust_p else None
+        df = pd.DataFrame([
+            ["고객수", fmt(cust_c), pct_ratio(cust_c, cust_p)[0]],
+            ["객단가", fmt(aov_c), pct_ratio(aov_c, aov_p)[0]],
+        ], columns=["구분", "기준일", "전년비"])
+        st.dataframe(style_delta_cols(df, ["전년비"]), hide_index=True, use_container_width=True)
+
+    _cust_aov_table(cur_all, prev_all, "전체 고객수 · 객단가")
+    _cust_aov_table(cur_cert, prev_cert, "당월인증 고객수 · 객단가")
+
+# ====================================================================================
+# 일자별 탭 (화면 = 값 + 전년비만, 전년 원본값은 엑셀에만)
+# ====================================================================================
+with tab_daily:
+    daily_uc = A.daily_uv_cert_table(cur_data["uv"], cur_data["cert"], sel_dates, partners, exclude_af=exclude_af)
+    daily_uc_ly = (A.daily_uv_cert_table(ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, ly_partners)
+                   if (not ly_cert_data["uv"].empty or not ly_cert_data["cert"].empty) else None)
+
+    st.subheader("UV")
+    uv_rows = []
+    for i, d in enumerate(sorted(sel_dates)):
+        prev_v = daily_uc_ly.iloc[i]["UV"] if daily_uc_ly is not None and i < len(daily_uc_ly) else None
+        uv_rows.append([d, fmt(daily_uc.iloc[i]["UV"]), pct_ratio(daily_uc.iloc[i]["UV"], prev_v)[0]])
+    df_uv = pd.DataFrame(uv_rows, columns=["일자", "UV", "전년비"])
+    st.dataframe(style_delta_cols(df_uv, ["전년비"]), hide_index=True, use_container_width=True)
+
+    st.subheader("인증자수 (전체·신규·윈백·기존)")
+    cert_rows = []
+    for i, d in enumerate(sorted(sel_dates)):
+        r = daily_uc.iloc[i]
+        pr = daily_uc_ly.iloc[i] if daily_uc_ly is not None and i < len(daily_uc_ly) else None
+        row = [d]
+        for col in ["인증_전체", "인증_신규", "인증_윈백", "인증_기존"]:
+            pv = pr[col] if pr is not None else None
+            row += [fmt(r[col]), pct_ratio(r[col], pv)[0]]
+        cert_rows.append(row)
+    df_cert = pd.DataFrame(cert_rows, columns=["일자", "전체", "Δ", "신규", "Δ", "윈백", "Δ", "기존", "Δ"])
+    st.dataframe(style_delta_cols(df_cert, ["Δ"]), hide_index=True, use_container_width=True)
+
+    paytype_d = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="daily_paytype")
+    ptd = "net" if paytype_d == "순결제" else "tot"
+
+    def _daily_amt_block(cert_only, title):
+        cur_d = A.daily_amt_table(cur_data["amt"], sel_dates, partners, cert_only=cert_only)
+        ly_d = (A.daily_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, cert_only=cert_only)
+                if not ly_amt_data["amt"].empty else None)
+        st.subheader(f"{title} (전체·신규·윈백·기존)")
+        rows = []
+        for i in range(len(cur_d)):
+            r = cur_d.iloc[i]
+            pr = ly_d.iloc[i] if ly_d is not None and i < len(ly_d) else None
+            row = [r["일자"]]
+            for s in ["전체"] + A.STATUSES:
+                c = r[f"{s}_{ptd}"]
+                p = pr[f"{s}_{ptd}"] if pr is not None else None
+                row += [fmt(c), pct_ratio(c, p)[0]]
+            rows.append(row)
+        cols = ["일자"]
+        for s in ["전체", "신규", "윈백", "기존"]:
+            cols += [s, "Δ"]
+        df = pd.DataFrame(rows, columns=cols)
+        st.dataframe(style_delta_cols(df, ["Δ"]), hide_index=True, use_container_width=True)
+        return cur_d, ly_d
+
+    all_cur_d, all_ly_d = _daily_amt_block(False, "전체거래액")
+    cert_cur_d, cert_ly_d = _daily_amt_block(True, "당월인증거래액")
+
+    def _daily_cust_aov(cur_d, ly_d, title):
+        st.subheader(title)
+        rows = []
+        for i in range(len(cur_d)):
+            r = cur_d.iloc[i]
+            pr = ly_d.iloc[i] if ly_d is not None and i < len(ly_d) else None
+            cust_c = r[f"전체_cust_{ptd}"]
+            aov_c = r[f"전체_{ptd}"] / cust_c if cust_c else 0
+            cust_p = pr[f"전체_cust_{ptd}"] if pr is not None else None
+            aov_p = (pr[f"전체_{ptd}"] / cust_p) if (pr is not None and cust_p) else None
+            rows.append([r["일자"], fmt(cust_c), pct_ratio(cust_c, cust_p)[0], fmt(aov_c), pct_ratio(aov_c, aov_p)[0]])
+        df = pd.DataFrame(rows, columns=["일자", "고객수", "Δ", "객단가", "Δ"])
+        st.dataframe(style_delta_cols(df, ["Δ"]), hide_index=True, use_container_width=True)
+
+    _daily_cust_aov(cert_cur_d, cert_ly_d, "고객수 · 객단가 (당월인증 기준)")
+    _daily_cust_aov(all_cur_d, all_ly_d, "고객수 · 객단가 (전체거래액 기준)")
+    st.caption("전년도 원본 값은 화면에 표시하지 않으며, 아래 엑셀 다운로드에는 함께 포함됩니다.")
+
+    excel_bytes = to_excel_bytes({
+        "UV_인증자수": daily_uc.assign(UV_전년=daily_uc_ly["UV"] if daily_uc_ly is not None else np.nan),
+        "전체거래액": all_cur_d,
+        "당월인증거래액": cert_cur_d,
+    })
+    st.download_button("⤓ 엑셀 다운로드 (일자별, 전년도 원본 포함)", excel_bytes, file_name="일자별_실적.xlsx")
+
+# ====================================================================================
+# 제휴사별 실적 탭
+# ====================================================================================
+with tab_partner:
+    paytype_p = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="partner_paytype")
+    ptp = "net" if paytype_p == "순결제" else "tot"
+
+    pf_cur = A.partner_full_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, partners, exclude_af=exclude_af)
+    pf_ly = (A.partner_full_table(ly_amt_data["amt"], ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, ly_partners)
+             if not ly_amt_data["amt"].empty else None)
+    ly_map = {r["제휴사"]: r for _, r in pf_ly.iterrows()} if pf_ly is not None else {}
+
+    st.subheader(f"전체 제휴사 (당월인증거래액 발생 기준, 내림차순 · {len(pf_cur)}개)")
+    rows = []
+    for _, r in pf_cur.iterrows():
+        p = ly_map.get(r["제휴사"])
+        cert_c, all_c = r[f"cert_{ptp}"], r[f"all_{ptp}"]
+        cust_c = r[f"cust_{ptp}"]
+        aov_c = all_c / cust_c if cust_c else 0
+        if p is not None:
+            cert_p, all_p, cust_p = p[f"cert_{ptp}"], p[f"all_{ptp}"], p[f"cust_{ptp}"]
+            aov_p = all_p / cust_p if cust_p else None
+            uv_p, cert_cnt_p = p["UV"], p["인증수"]
+        else:
+            cert_p = all_p = cust_p = aov_p = uv_p = cert_cnt_p = None
+        rows.append([
+            r["제휴사"], fmt(r["UV"]), pct_ratio(r["UV"], uv_p)[0],
+            fmt(r["인증수"]), pct_ratio(r["인증수"], cert_cnt_p)[0],
+            fmt(cert_c), pct_ratio(cert_c, cert_p)[0],
+            fmt(all_c), pct_ratio(all_c, all_p)[0],
+            fmt(cust_c), pct_ratio(cust_c, cust_p)[0],
+            fmt(aov_c), pct_ratio(aov_c, aov_p)[0],
+        ])
+    cols = ["제휴사", "UV", "Δ", "인증수", "Δ", "당월인증거래액", "Δ", "전체거래액", "Δ", "고객수", "Δ", "객단가", "Δ"]
+    df_partner = pd.DataFrame(rows, columns=cols)
+    st.dataframe(style_delta_cols(df_partner, ["Δ"]), hide_index=True, use_container_width=True)
+    st.caption("전년비는 전년도 동일 제휴사 코호트 기준(전년도 데이터가 없으면 \"신규\" 표기).")
+
+    st.subheader("제휴사 선택 → 일자별 상세")
+    sel_partner = st.selectbox("제휴사", partners)
+    pd_cur = A.partner_daily_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, sel_partner, exclude_af=exclude_af)
+    show_cols = ["일자", "UV", "인증_전체",
+                 f"당월인증_{ptp}", f"전체거래액_{ptp}", f"고객수_{ptp}"]
+    disp = pd_cur[show_cols].rename(columns={
+        "인증_전체": "인증수", f"당월인증_{ptp}": "당월인증거래액",
+        f"전체거래액_{ptp}": "전체거래액", f"고객수_{ptp}": "고객수"})
+    disp["객단가"] = (disp["전체거래액"] / disp["고객수"].replace(0, np.nan)).fillna(0)
+    st.dataframe(disp.applymap(lambda v: fmt(v) if isinstance(v, (int, float, np.floating)) else v) if False else disp, hide_index=True, use_container_width=True)
+
+    excel_bytes = to_excel_bytes({
+        "제휴사별_순결제": pf_cur.assign(**{f"전년_{c}": pf_ly[c] if pf_ly is not None and c in pf_ly.columns else np.nan
+                                         for c in ["cert_net", "all_net", "cust_net"]}),
+        "제휴사별_총결제": pf_cur.assign(**{f"전년_{c}": pf_ly[c] if pf_ly is not None and c in pf_ly.columns else np.nan
+                                         for c in ["cert_tot", "all_tot", "cust_tot"]}),
+        f"{sel_partner}_일자별": pd_cur,
+    })
+    st.download_button("⤓ 엑셀 다운로드 (제휴사별, 전년도 원본 포함)", excel_bytes, file_name="제휴사별_실적.xlsx")
+
+# ====================================================================================
+# 카테고리별 실적 탭
+# ====================================================================================
+with tab_cat:
+    paytype_c = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="cat_paytype")
+    ptc = "net" if paytype_c == "순결제" else "tot"
+
+    cat_cert = A.group_amt_table(cur_data["amt"], sel_dates, partners, "물리대카테", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+    cat_all = A.group_amt_table(cur_data["amt"], sel_dates, partners, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+    cat = pd.merge(cat_cert, cat_all, on="물리대카테", how="outer").fillna(0)
+    cat = cat.sort_values("cert_tot", ascending=False).reset_index(drop=True)
+
+    cat_ly = None
+    if not ly_amt_data["amt"].empty:
+        cat_cert_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "물리대카테", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+        cat_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+        cat_ly = pd.merge(cat_cert_ly, cat_all_ly, on="물리대카테", how="outer").fillna(0).set_index("물리대카테")
+
+    st.subheader(f"전체 카테고리 (당월인증거래액 내림차순 · {len(cat)}개)")
+    rows = []
+    for _, r in cat.iterrows():
+        p = cat_ly.loc[r["물리대카테"]] if (cat_ly is not None and r["물리대카테"] in cat_ly.index) else None
+        cert_c, all_c = r[f"cert_{ptc}"], r[f"all_{ptc}"]
+        cert_p = p[f"cert_{ptc}"] if p is not None else None
+        all_p = p[f"all_{ptc}"] if p is not None else None
+        rows.append([r["물리대카테"], fmt(cert_c), pct_ratio(cert_c, cert_p)[0], fmt(all_c), pct_ratio(all_c, all_p)[0]])
+    df_cat = pd.DataFrame(rows, columns=["카테고리", "당월인증거래액", "Δ", "전체거래액", "Δ"])
+    st.dataframe(style_delta_cols(df_cat, ["Δ"]), hide_index=True, use_container_width=True)
+    st.caption("전년도 원본 값은 엑셀 다운로드에 포함됩니다.")
+
+    excel_bytes = to_excel_bytes({"카테고리별": cat.assign(**({} if cat_ly is None else {
+        "전년_cert_tot": cat["물리대카테"].map(cat_ly["cert_tot"]),
+        "전년_cert_net": cat["물리대카테"].map(cat_ly["cert_net"]),
+        "전년_all_tot": cat["물리대카테"].map(cat_ly["all_tot"]),
+        "전년_all_net": cat["물리대카테"].map(cat_ly["all_net"]),
+    }))})
+    st.download_button("⤓ 엑셀 다운로드 (카테고리별, 전년도 원본 포함)", excel_bytes, file_name="카테고리별_실적.xlsx")
+
+# ====================================================================================
+# 브랜드별 실적 탭
+# ====================================================================================
+with tab_brand:
+    paytype_b = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="brand_paytype")
+    ptb = "net" if paytype_b == "순결제" else "tot"
+
+    br_cert = A.group_amt_table(cur_data["amt"], sel_dates, partners, "Admin브랜드명", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+    br_all = A.group_amt_table(cur_data["amt"], sel_dates, partners, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+    br = pd.merge(br_cert, br_all, on="Admin브랜드명", how="outer").fillna(0)
+    br = br.sort_values("cert_tot", ascending=False).head(25).reset_index(drop=True)
+
+    br_ly = None
+    if not ly_amt_data["amt"].empty:
+        br_cert_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "Admin브랜드명", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+        br_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+        br_ly = pd.merge(br_cert_ly, br_all_ly, on="Admin브랜드명", how="outer").fillna(0).set_index("Admin브랜드명")
+
+    st.subheader("브랜드 TOP 25 (당월인증거래액 내림차순)")
+    rows = []
+    for _, r in br.iterrows():
+        p = br_ly.loc[r["Admin브랜드명"]] if (br_ly is not None and r["Admin브랜드명"] in br_ly.index) else None
+        cert_c, all_c = r[f"cert_{ptb}"], r[f"all_{ptb}"]
+        cert_p = p[f"cert_{ptb}"] if p is not None else None
+        all_p = p[f"all_{ptb}"] if p is not None else None
+        rows.append([r["Admin브랜드명"], fmt(cert_c), pct_ratio(cert_c, cert_p)[0], fmt(all_c), pct_ratio(all_c, all_p)[0]])
+    df_br = pd.DataFrame(rows, columns=["브랜드", "당월인증거래액", "Δ", "전체거래액", "Δ"])
+    st.dataframe(style_delta_cols(df_br, ["Δ"]), hide_index=True, use_container_width=True)
+    st.caption("전년도 원본 값은 엑셀 다운로드에 포함됩니다.")
+
+    excel_bytes = to_excel_bytes({"브랜드별_TOP25": br.assign(**({} if br_ly is None else {
+        "전년_cert_tot": br["Admin브랜드명"].map(br_ly["cert_tot"]),
+        "전년_cert_net": br["Admin브랜드명"].map(br_ly["cert_net"]),
+        "전년_all_tot": br["Admin브랜드명"].map(br_ly["all_tot"]),
+        "전년_all_net": br["Admin브랜드명"].map(br_ly["all_net"]),
+    }))})
+    st.download_button("⤓ 엑셀 다운로드 (브랜드별, 전년도 원본 포함)", excel_bytes, file_name="브랜드별_실적.xlsx")
+
+# ----------------------------------------------------------------------------------
+# 전체 JSON 내보내기 (사이드바 하단)
+# ----------------------------------------------------------------------------------
+st.sidebar.divider()
+if st.sidebar.button("⤓ 현재 화면 JSON 스냅샷 만들기"):
+    snapshot = {
+        "기간": [str(d) for d in sel_dates],
+        "제휴사": partners,
+        "UV": uv_cur,
+        "인증자수": cert_cur,
+    }
+    import json
+    st.sidebar.download_button("JSON 다운로드", json.dumps(snapshot, ensure_ascii=False, indent=2),
+                                file_name="lf_affiliate_snapshot.json", mime="application/json")
