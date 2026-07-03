@@ -16,6 +16,7 @@ LF몰 일반제휴 실적 대시보드 (Streamlit)
 - 신규/윈백/기존 구분은 카테고리·브랜드 탭을 제외한 모든 탭에 적용
 """
 import io
+import os
 import datetime as dt
 
 import numpy as np
@@ -25,6 +26,10 @@ import streamlit as st
 import lf_analysis as A
 
 st.set_page_config(page_title="LF몰 일반제휴 실적", page_icon="📊", layout="wide")
+
+# 일자별 목표(순결제 기준) 파일 - 연말까지 고정값이라 업로드 대신 리포에 고정 파일로 관리한다.
+# 목표가 갱신되면 이 파일(target_data.xlsx)만 교체하면 된다 (별도 요청 시 반영).
+TARGET_FILE = os.path.join(os.path.dirname(__file__), "target_data.xlsx")
 
 # ----------------------------------------------------------------------------------
 # 캐싱된 로더 (같은 파일이면 재계산하지 않음)
@@ -40,8 +45,11 @@ def _load_multi(list_of_bytes: tuple) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def _load_target(file_bytes: bytes) -> pd.DataFrame:
-    return A.load_target_file(file_bytes)
+def _load_target_from_disk(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    with open(path, "rb") as f:
+        return A.load_target_file(f.read())
 
 
 # ----------------------------------------------------------------------------------
@@ -122,10 +130,6 @@ f_ly_amt = st.sidebar.file_uploader(
     "③ 전년도 거래 실적 (분기별, 여러 파일 업로드 가능)",
     type=["xlsx"], accept_multiple_files=True, key="f_ly_amt",
 )
-f_target = st.sidebar.file_uploader(
-    "④ 일자별 목표 (순결제 기준, 선택)",
-    type=["xlsx"], key="f_target",
-)
 
 st.sidebar.divider()
 st.sidebar.header("⚙ Step 2. 분석 설정")
@@ -174,7 +178,7 @@ exclude_af = "SSNGCD03" if excl_ssng else None
 ly_cert_data = _load_single(f_ly_cert.getvalue()) if f_ly_cert else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
 ly_amt_bytes = tuple(f.getvalue() for f in f_ly_amt) if f_ly_amt else tuple()
 ly_amt_data = _load_multi(ly_amt_bytes) if ly_amt_bytes else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
-target_df = _load_target(f_target.getvalue()) if f_target else pd.DataFrame()
+target_df = _load_target_from_disk(TARGET_FILE)
 
 ly_all_dates = A.ly_dates(sel_dates, yoy_mode)
 
