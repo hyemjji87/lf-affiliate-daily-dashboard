@@ -322,3 +322,115 @@ def partner_daily_table(amt_df, uv_df, cert_df, dates, partner, exclude_af=None)
         columns={"전체_tot": "당월인증_tot", "전체_net": "당월인증_net"}), on="일자", how="left")
     return out.rename(columns={"전체_tot": "전체거래액_tot", "전체_net": "전체거래액_net",
                                 "전체_cust_tot": "고객수_tot", "전체_cust_net": "고객수_net"})
+
+
+# --------------------------------------------------------------------------------------
+# 5) 일자별 목표(순결제 기준) 로딩 & 조회 - "목표비" 기능용
+#    파일 구조: 3행 병합헤더('구분'/'목표 거래액' -> '전체 인증 기준'/'당월인증 기준' ->
+#    'total'/'신규'/'윈백'), 4행부터 일자별 데이터. 기존 = total - 신규 - 윈백로 계산한다.
+# --------------------------------------------------------------------------------------
+def load_target_file(file_bytes: bytes) -> pd.DataFrame:
+    """반환 컬럼: 일자, all_total/all_신규/all_윈백/all_기존, cert_total/cert_신규/cert_윈백/cert_기존
+    (all_ = "전체 인증 기준" = 전체거래액 목표, cert_ = "당월인증 기준" = 당월인증거래액 목표,
+    전부 순결제 기준. 기존 = total - 신규 - 윈백로 계산.)"""
+    sheets = _read_all_sheets(file_bytes)
+    target_sheet = None
+    for sn, data in sheets.items():
+        if "목표" in sn:
+            target_sheet = data
+            break
+    if target_sheet is None and sheets:
+        target_sheet = next(iter(sheets.values()))
+    if not target_sheet:
+        return pd.DataFrame()
+
+    header_rows = target_sheet[:5]
+    all_start = cert_start = None
+    for row in header_rows:
+        for j, c in enumerate(row):
+            s = str(c)
+            if all_start is None and "전체" in s and "인증" in s:
+                all_start = j
+            if cert_start is None and "당월인증" in s:
+                cert_start = j
+    if all_start is None or cert_start is None:
+        all_start, cert_start = 6, 9  # 관찰된 파일 구조로 폴백
+
+    def _offsets(start):
+        new_off, wb_off = 1, 2
+        for row in header_rows:
+            for j in range(start, min(start + 3, len(row))):
+                s = str(row[j])
+                if "신규" in s:
+                    new_off = j - start
+                if "윈백" in s or "WIN" in s.upper():
+                    wb_off = j - start
+        return new_off, wb_off
+
+    all_new_off, all_wb_off = _offsets(all_start)
+    cert_new_off, cert_wb_off = _offsets(cert_start)
+
+    start_row = None
+    for i, row in enumerate(target_sheet):
+        if row and isinstance(row[0], (dt.date, dt.datetime)):
+            start_row = i
+            break
+    if start_row is None:
+        return pd.DataFrame()
+
+    def _num(row, idx):
+        try:
+            v = row[idx]
+            return float(v) if v not in (None, "") else 0.0
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    rows = []
+    for row in target_sheet[start_row:]:
+        if not row or row[0] is None:
+            continue
+        d = row[0]
+        if isinstance(d, dt.datetime):
+            d = d.date()
+        if not isinstance(d, dt.date):
+            continue
+        all_total = _num(row, all_start)
+        all_new = _num(row, all_start + all_new_off)
+        all_wb = _num(row, all_start + all_wb_off)
+        cert_total = _num(row, cert_start)
+        cert_new = _num(row, cert_start + cert_new_off)
+        cert_wb = _num(row, cert_start + cert_wb_off)
+        rows.append({
+            "일자": d,
+            "all_total": all_total, "all_신규": all_new, "all_윈백": all_wb,
+            "all_기존": all_total - all_new - all_wb,
+            "cert_total": cert_total, "cert_신규": cert_new, "cert_윈백": cert_wb,
+            "cert_기존": cert_total - cert_new - cert_wb,
+        })
+    return pd.DataFrame(rows)
+
+
+def target_sum(target_df: pd.DataFrame, dates: list, group: str, status: str = "total"):
+    """선택 기간(dates)에 해당하는 일별 목표 합계. 매칭되는 날짜가 하나도 없으면 None."""
+    if target_df is None or target_df.empty:
+        return None
+    col = f"{group}_{status}"
+    if col not in target_df.columns:
+        return None
+    sub = target_df[target_df["일자"].isin(dates)]
+    if sub.empty:
+        return None
+    return float(sub[col].sum())
+
+
+def target_lookup(target_df: pd.DataFrame, date, group: str, status: str = "total"):
+    """특정 하루의 목표값. 목표 파일에 해당 날짜가 없으면 None."""
+    if target_df is None or target_df.empty:
+        return None
+    col = f"{group}_{status}"
+    if col not in target_df.columns:
+        return None
+    sub = target_df[target_df["일자"] == date]
+    if sub.empty:
+        return None
+    return float(sub.iloc[0][col])

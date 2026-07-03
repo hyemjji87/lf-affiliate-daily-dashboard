@@ -39,6 +39,11 @@ def _load_multi(list_of_bytes: tuple) -> dict:
     return A.merge_workbooks(list(list_of_bytes))
 
 
+@st.cache_data(show_spinner=False)
+def _load_target(file_bytes: bytes) -> pd.DataFrame:
+    return A.load_target_file(file_bytes)
+
+
 # ----------------------------------------------------------------------------------
 # 포맷 유틸
 # ----------------------------------------------------------------------------------
@@ -59,6 +64,14 @@ def pct_ratio(cur, prev):
     if pct < 0:
         return f"△{abs(pct)}%", "danger", ratio
     return f"▼{pct}%", "success", ratio
+
+
+def target_ratio(cur, target):
+    """목표비: pct_ratio와 동일한 서식(▼달성/초과, △미달)을 쓰되, 목표가 아예 없는 경우
+    ('신규'가 아니라) 항상 '-'로 표기한다."""
+    if target is None:
+        return "-", "muted", None
+    return pct_ratio(cur, target)
 
 
 COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "accent": "#0969da"}
@@ -109,6 +122,10 @@ f_ly_amt = st.sidebar.file_uploader(
     "③ 전년도 거래 실적 (분기별, 여러 파일 업로드 가능)",
     type=["xlsx"], accept_multiple_files=True, key="f_ly_amt",
 )
+f_target = st.sidebar.file_uploader(
+    "④ 일자별 목표 (순결제 기준, 선택)",
+    type=["xlsx"], key="f_target",
+)
 
 st.sidebar.divider()
 st.sidebar.header("⚙ Step 2. 분석 설정")
@@ -157,6 +174,7 @@ exclude_af = "SSNGCD03" if excl_ssng else None
 ly_cert_data = _load_single(f_ly_cert.getvalue()) if f_ly_cert else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
 ly_amt_bytes = tuple(f.getvalue() for f in f_ly_amt) if f_ly_amt else tuple()
 ly_amt_data = _load_multi(ly_amt_bytes) if ly_amt_bytes else {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame()}
+target_df = _load_target(f_target.getvalue()) if f_target else pd.DataFrame()
 
 ly_all_dates = A.ly_dates(sel_dates, yoy_mode)
 
@@ -224,16 +242,31 @@ with tab_ov:
         cur_total = cur["전체"][pt]
         prev_total = prev["전체"][pt]
         d_all, _, _ = pct_ratio(cur_total, prev_total)
-        st.markdown(f"**{title}**  \n### {fmt(cur_total)}  <span style='font-size:13px'>전년비 {d_all}</span>", unsafe_allow_html=True)
+        show_target = pt == "net" and not target_df.empty
+        group = "cert" if label == "당월인증" else "all"
+        header = f"**{title}**  \n### {fmt(cur_total)}  <span style='font-size:13px'>전년비 {d_all}</span>"
+        if show_target:
+            tgt_total = A.target_sum(target_df, sel_dates, group, "total")
+            t_all, _, _ = target_ratio(cur_total, tgt_total)
+            header += f"  <span style='font-size:13px'>목표비 {t_all}</span>"
+        st.markdown(header, unsafe_allow_html=True)
         rows = []
+        status_target_key = {"신규": "신규", "WIN-BACK": "윈백", "기존": "기존"}
         for k, lbl in [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]:
             c = cur[k][pt]
             p = prev[k][pt]
             share = f"{c / cur_total * 100:.1f}%" if cur_total else "-"
             d, _, _ = pct_ratio(c, p)
-            rows.append([lbl, fmt(c), share, d])
-        df = pd.DataFrame(rows, columns=["구분", "기준일", "비중", "전년비"])
-        st.dataframe(style_delta_cols(df, ["전년비"]), hide_index=True, use_container_width=True)
+            row = [lbl, fmt(c), share, d]
+            if show_target:
+                tgt_v = A.target_sum(target_df, sel_dates, group, status_target_key[k])
+                t, _, _ = target_ratio(c, tgt_v)
+                row.append(t)
+            rows.append(row)
+        cols = ["구분", "기준일", "비중", "전년비"] + (["목표비"] if show_target else [])
+        delta_cols = ["전년비"] + (["목표비"] if show_target else [])
+        df = pd.DataFrame(rows, columns=cols)
+        st.dataframe(style_delta_cols(df, delta_cols), hide_index=True, use_container_width=True)
         return cur, prev
 
     cur_all, prev_all = _amt_block("전체", "전체거래액")
@@ -291,6 +324,9 @@ with tab_daily:
         ly_d = (A.daily_amt_table(ly_amt_data["amt"], ly_all_dates, None, cert_only=cert_only)
                 if not ly_amt_data["amt"].empty else None)
         st.subheader(f"{title} (전체·신규·윈백·기존)")
+        show_target = ptd == "net" and not target_df.empty
+        group = "cert" if cert_only else "all"
+        status_target_key = {"전체": "total", "신규": "신규", "WIN-BACK": "윈백", "기존": "기존"}
         rows = []
         for i in range(len(cur_d)):
             r = cur_d.iloc[i]
@@ -300,12 +336,19 @@ with tab_daily:
                 c = r[f"{s}_{ptd}"]
                 p = pr[f"{s}_{ptd}"] if pr is not None else None
                 row += [fmt(c), pct_ratio(c, p)[0]]
+                if show_target:
+                    tgt_v = A.target_lookup(target_df, r["일자"], group, status_target_key[s])
+                    t, _, _ = target_ratio(c, tgt_v)
+                    row.append(t)
             rows.append(row)
         cols = ["일자"]
         delta_cols = []
         for s in ["전체", "신규", "윈백", "기존"]:
             cols += [s, f"{s} 전년비"]
             delta_cols.append(f"{s} 전년비")
+            if show_target:
+                cols.append(f"{s} 목표비")
+                delta_cols.append(f"{s} 목표비")
         df = pd.DataFrame(rows, columns=cols)
         st.dataframe(style_delta_cols(df, delta_cols), hide_index=True, use_container_width=True)
         return cur_d, ly_d
