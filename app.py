@@ -22,6 +22,9 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 import lf_analysis as A
 
@@ -61,6 +64,13 @@ def fmt(n):
     return f"{round(n):,}"
 
 
+def sub(title: str):
+    """st.subheader는 표 폰트(13px) 대비 지나치게 크므로, 표보다는 크되 절제된 크기의
+    섹션 제목으로 대체."""
+    st.markdown(f"<div style='font-size:16px;font-weight:700;margin:18px 0 6px;'>{title}</div>",
+                unsafe_allow_html=True)
+
+
 def pct_ratio(cur, prev):
     """엑셀/화면 공통으로 쓸 (표시문자열, 색상, 원시비율) 반환."""
     if prev is None or prev == 0 or pd.isna(prev) or cur is None or pd.isna(cur):
@@ -75,16 +85,16 @@ def pct_ratio(cur, prev):
 
 
 def target_ratio(cur, target):
-    """목표비: 실적/목표 달성률(%) 그대로를 보여준다 (증감률 아님). 목표비는 절대 음수가
-    될 수 없으므로 전년비처럼 ▼/△ 두 기호를 쓰지 않고 항상 "▼"만 쓰되, 100% 이상(달성·초과)이면
-    초록, 100% 미만(미달)이면 빨강으로 색만 구분한다. 목표가 아예 없으면 '-'로 표기한다."""
+    """목표비: 실적/목표 달성률(%) 숫자만 보여준다 - 전년비와 달리 ▼/△ 기호는 아예 쓰지 않는다
+    (목표비는 절대 음수가 될 수 없어서 방향 기호가 의미가 없음). 100% 이상(달성·초과)이면 초록,
+    100% 미만(미달)이면 빨강으로 색만 구분한다. 목표가 아예 없으면 '-'로 표기한다."""
     if (target is None or (isinstance(target, float) and pd.isna(target)) or target == 0
             or cur is None or (isinstance(cur, float) and pd.isna(cur))):
         return "-", "muted", None
     ratio = cur / target
     pct = round(ratio * 100)
     color = "success" if pct >= 100 else "danger"
-    return f"▼{pct}%", color, ratio
+    return f"{pct}%", color, ratio
 
 
 COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "accent": "#0969da"}
@@ -186,6 +196,207 @@ def to_excel_bytes(sheets: dict, pct_cols_by_sheet: dict | None = None) -> bytes
                         col_letter = ws.cell(row=1, column=col_idx).column_letter
                         for r in range(2, len(df) + 2):
                             ws[f"{col_letter}{r}"].number_format = EXCEL_PCT_FMT
+    return buf.getvalue()
+
+
+_WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+_THIN = Side(style="thin", color="D0D7DE")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_TITLE_FONT = Font(bold=True, size=12)
+_HEADER_FONT = Font(bold=True, size=10)
+_HEADER_FILL = PatternFill("solid", fgColor="F0F3F6")
+_CENTER = Alignment(horizontal="center", vertical="center")
+_LEFT = Alignment(horizontal="left", vertical="center")
+
+
+def _pct_font(is_good: bool) -> Font:
+    return Font(color=("1A7F37" if is_good else "CF222E"), bold=True)
+
+
+def build_exec_report_excel(
+    sel_dates, ly_all_dates, yoy_mode_label,
+    cur_all, prev_all, cur_cert, prev_cert,
+    cert_cur, cert_prev,
+    all_cur_d, all_ly_d, cert_cur_d, cert_ly_d,
+    pf_cur, pf_ly, target_df,
+) -> bytes:
+    """임원보고용 종합 리포트: ① 지표별 실적 요약 ② 일자별/신규·윈백·기존별 거래액 실적
+    (전년비·목표달성률·MIX 포함) ③ 제휴사별 인증/거래액 실적 (전년비 포함), 순결제 기준 고정.
+    사용자가 제공한 참조 엑셀 양식을 따라 구성했다."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "종합 리포트"
+    days_sorted = sorted(sel_dates)
+    n_days = len(days_sorted) or 1
+    r = 1
+
+    def title_row(text):
+        nonlocal r
+        ws.cell(r, 1, text).font = _TITLE_FONT
+        r += 2
+
+    def style_header(row):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row, c)
+            if cell.value is not None or c <= 40:
+                cell.font = _HEADER_FONT
+                cell.fill = _HEADER_FILL
+                cell.alignment = _CENTER
+                cell.border = _BORDER
+
+    def style_row(row, ncols, first_left=True):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row, c)
+            cell.border = _BORDER
+            cell.alignment = _LEFT if (c == 1 and first_left) else _CENTER
+
+    # ---------------- 1) 지표별 실적 요약 ----------------
+    title_row("■ 지표별 실적 요약")
+    hdr1 = r
+    ws.cell(hdr1, 1, "구분")
+    ws.merge_cells(start_row=hdr1, start_column=1, end_row=hdr1 + 1, end_column=1)
+    groups1 = [("거래액", 2), ("당월인증 거래액", 2), ("인증회원수", 2)]
+    col = 2
+    for name, span in groups1:
+        ws.cell(hdr1, col, name)
+        ws.merge_cells(start_row=hdr1, start_column=col, end_row=hdr1, end_column=col + span - 1)
+        col += span
+    for i, lbl in enumerate(["MTD", "일평균"] * 3):
+        ws.cell(hdr1 + 1, 2 + i, lbl)
+    total_cols1 = 1 + sum(s for _, s in groups1)
+    style_header(hdr1)
+    style_header(hdr1 + 1)
+    r = hdr1 + 2
+    all_net_total = cur_all["전체"]["net"]
+    cert_net_total = cur_cert["전체"]["net"]
+    cert_cnt_total = cert_cur["전체"]
+    vals1 = [all_net_total, all_net_total / n_days, cert_net_total, cert_net_total / n_days,
+             cert_cnt_total, cert_cnt_total / n_days]
+    ws.cell(r, 1, "")
+    for i, v in enumerate(vals1):
+        cell = ws.cell(r, 2 + i, round(v))
+        cell.number_format = "#,##0"
+    style_row(r, total_cols1)
+    r += 2
+
+    # ---------------- 2) 일자별/신규·윈백·기존별 거래액 실적 ----------------
+    title_row("■ 일자별/신규·윈백·기존별 거래액 실적 (순결제 기준)")
+    hdr2 = r
+    ws.cell(hdr2, 1, "구분")
+    ws.merge_cells(start_row=hdr2, start_column=1, end_row=hdr2 + 1, end_column=1)
+    for i, d in enumerate(days_sorted):
+        c = 2 + i
+        ws.cell(hdr2, c, d.strftime("%Y-%m-%d"))
+        ws.cell(hdr2 + 1, c, _WEEKDAY_KR[d.weekday()])
+    base = 2 + len(days_sorted)
+    extra_labels = ["MTD 실적", "전년비", "목표달성률", "MIX"]
+    for i, lbl in enumerate(extra_labels):
+        ws.cell(hdr2, base + i, lbl)
+        ws.merge_cells(start_row=hdr2, start_column=base + i, end_row=hdr2 + 1, end_column=base + i)
+    total_cols2 = base + len(extra_labels) - 1
+    style_header(hdr2)
+    style_header(hdr2 + 1)
+    r = hdr2 + 2
+
+    def write_metric_rows(label_total, daily_df, ly_daily_df, target_group):
+        nonlocal r
+        status_defs = [("전체", "total", label_total), ("신규", "신규", "신규"),
+                        ("WIN-BACK", "윈백", "WIN-BACK"), ("기존", "기존", "기존")]
+        total_mtd = None
+        for key, tgt_status, label in status_defs:
+            row_label = label if key == "전체" else f"    {label}"
+            daily_vals = []
+            for d in days_sorted:
+                match = daily_df[daily_df["일자"] == d]
+                v = float(match.iloc[0][f"{key}_net"]) if not match.empty else 0.0
+                daily_vals.append(v)
+            mtd = sum(daily_vals)
+            if key == "전체":
+                total_mtd = mtd
+            ly_sum = float(ly_daily_df[f"{key}_net"].sum()) if (ly_daily_df is not None and not ly_daily_df.empty) else None
+            _, d_color, d_ratio = pct_ratio(mtd, ly_sum)
+            tgt_v = A.target_sum(target_df, sel_dates, target_group, tgt_status) if not target_df.empty else None
+            _, t_color, t_ratio = target_ratio(mtd, tgt_v)
+            mix = (mtd / total_mtd) if total_mtd else 0
+
+            ws.cell(r, 1, row_label)
+            for i, v in enumerate(daily_vals):
+                cell = ws.cell(r, 2 + i, round(v))
+                cell.number_format = "#,##0"
+            mtd_cell = ws.cell(r, base, round(mtd))
+            mtd_cell.number_format = "#,##0"
+            ly_cell = ws.cell(r, base + 1, round(d_ratio, 4) if d_ratio is not None else None)
+            ly_cell.number_format = EXCEL_PCT_FMT
+            if d_color in ("success", "danger"):
+                ly_cell.font = _pct_font(d_color == "success")
+            tgt_cell = ws.cell(r, base + 2, round(t_ratio, 4) if t_ratio is not None else None)
+            tgt_cell.number_format = "0%"
+            if t_color in ("success", "danger"):
+                tgt_cell.font = _pct_font(t_color == "success")
+            mix_cell = ws.cell(r, base + 3, round(mix, 4))
+            mix_cell.number_format = "0%"
+            style_row(r, total_cols2)
+            r += 1
+
+    write_metric_rows("거래액", all_cur_d, all_ly_d, "all")
+    write_metric_rows("당월 인증거래액", cert_cur_d, cert_ly_d, "cert")
+    r += 1
+
+    # ---------------- 3) 제휴사별 인증/거래액 실적 ----------------
+    title_row("■ 제휴사별 인증/거래액 실적 (순결제 기준)")
+    hdr3 = r
+    ws.cell(hdr3, 1, "구분")
+    ws.merge_cells(start_row=hdr3, start_column=1, end_row=hdr3 + 1, end_column=1)
+    groups3 = [("거래액", 2), ("당월인증 거래액", 2), ("인증회원수", 2)]
+    col = 2
+    for name, span in groups3:
+        ws.cell(hdr3, col, name)
+        ws.merge_cells(start_row=hdr3, start_column=col, end_row=hdr3, end_column=col + span - 1)
+        col += span
+    for i, lbl in enumerate(["MTD", "전년비"] * 3):
+        ws.cell(hdr3 + 1, 2 + i, lbl)
+    total_cols3 = 1 + sum(s for _, s in groups3)
+    style_header(hdr3)
+    style_header(hdr3 + 1)
+    r = hdr3 + 2
+
+    def write_pair_row(label, triples, indent=False):
+        nonlocal r
+        ws.cell(r, 1, ("    " if indent else "") + label)
+        c = 2
+        for mtd_v, prev_v in triples:
+            mtd_cell = ws.cell(r, c, round(mtd_v))
+            mtd_cell.number_format = "#,##0"
+            _, d_color, d_ratio = pct_ratio(mtd_v, prev_v)
+            pc = ws.cell(r, c + 1, round(d_ratio, 4) if d_ratio is not None else None)
+            pc.number_format = EXCEL_PCT_FMT
+            if d_color in ("success", "danger"):
+                pc.font = _pct_font(d_color == "success")
+            c += 2
+        style_row(r, total_cols3)
+        r += 1
+
+    write_pair_row("전체", [
+        (all_net_total, prev_all["전체"]["net"] if prev_all["전체"]["net"] is not None else None),
+        (cert_net_total, prev_cert["전체"]["net"] if prev_cert["전체"]["net"] is not None else None),
+        (cert_cnt_total, cert_prev.get("전체")),
+    ])
+    pf_ly_idx = pf_ly.set_index("제휴사") if pf_ly is not None else None
+    for _, prow in pf_cur.iterrows():
+        p = pf_ly_idx.loc[prow["제휴사"]] if (pf_ly_idx is not None and prow["제휴사"] in pf_ly_idx.index) else None
+        write_pair_row(prow["제휴사"], [
+            (prow["all_net"], p["all_net"] if p is not None else None),
+            (prow["cert_net"], p["cert_net"] if p is not None else None),
+            (prow["인증수"], p["인증수"] if p is not None else None),
+        ], indent=True)
+
+    ws.column_dimensions["A"].width = 22
+    for c in range(2, max(total_cols2, total_cols3) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 13
+    ws.freeze_panes = "B1"
+
+    buf = io.BytesIO()
+    wb.save(buf)
     return buf.getvalue()
 
 
@@ -313,7 +524,7 @@ with tab_ov:
     with c2:
         st.metric("인증자수", fmt(cert_cur["전체"]), pct_ratio(cert_cur["전체"], cert_prev["전체"])[0])
 
-    st.subheader("인증자수 구성 (비중은 기준일 기준)")
+    sub("인증자수 구성 (비중은 기준일 기준)")
     rows = []
     for k, label in [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]:
         share = f"{cert_cur[k] / cert_cur['전체'] * 100:.1f}%" if cert_cur["전체"] else "-"
@@ -371,7 +582,7 @@ with tab_ov:
     cur_cert, prev_cert = _amt_block("당월인증", "당월인증거래액")
 
     def _cust_aov_table(cur, prev, title):
-        st.subheader(title)
+        sub(title)
         cust_c, cust_p = cur["전체"][f"cust_{pt}"], prev["전체"][f"cust_{pt}"]
         aov_c = cur["전체"][pt] / cust_c if cust_c else 0
         aov_p = (prev["전체"][pt] / cust_p) if cust_p else None
@@ -392,7 +603,7 @@ with tab_daily:
     daily_uc_ly = (A.daily_uv_cert_table(ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, None)
                    if (not ly_cert_data["uv"].empty or not ly_cert_data["cert"].empty) else None)
 
-    st.subheader("UV")
+    sub("UV")
     uv_rows = []
     for i, d in enumerate(sorted(sel_dates)):
         prev_v = daily_uc_ly.iloc[i]["UV"] if daily_uc_ly is not None and i < len(daily_uc_ly) else None
@@ -400,7 +611,7 @@ with tab_daily:
     df_uv = pd.DataFrame(uv_rows, columns=["일자", "UV", "전년비"])
     st.dataframe(style_delta_cols(df_uv, ["전년비"]), hide_index=True, use_container_width=True)
 
-    st.subheader("인증자수 (전체·신규·윈백·기존)")
+    sub("인증자수 (전체·신규·윈백·기존)")
     cert_rows, cert_color_rows = [], []
     for i, d in enumerate(sorted(sel_dates)):
         r = daily_uc.iloc[i]
@@ -424,7 +635,7 @@ with tab_daily:
         cur_d = A.daily_amt_table(cur_data["amt"], sel_dates, None, cert_only=cert_only)
         ly_d = (A.daily_amt_table(ly_amt_data["amt"], ly_all_dates, None, cert_only=cert_only)
                 if not ly_amt_data["amt"].empty else None)
-        st.subheader(f"{title} (전체·신규·윈백·기존)")
+        sub(f"{title} (전체·신규·윈백·기존)")
         show_target = ptd == "net" and not target_df.empty
         group = "cert" if cert_only else "all"
         status_target_key = {"전체": "total", "신규": "신규", "WIN-BACK": "윈백", "기존": "기존"}
@@ -456,7 +667,7 @@ with tab_daily:
     cert_cur_d, cert_ly_d = _daily_amt_block(True, "당월인증거래액")
 
     def _daily_cust_aov(cur_d, ly_d, title):
-        st.subheader(title)
+        sub(title)
         rows = []
         for i in range(len(cur_d)):
             r = cur_d.iloc[i]
@@ -492,7 +703,7 @@ with tab_partner:
              if not ly_amt_data["amt"].empty else None)
     ly_map = {r["제휴사"]: r for _, r in pf_ly.iterrows()} if pf_ly is not None else {}
 
-    st.subheader(f"전체 제휴사 (당월인증거래액 발생 기준, 내림차순 · {len(pf_cur)}개)")
+    sub(f"전체 제휴사 (당월인증거래액 발생 기준, 내림차순 · {len(pf_cur)}개)")
     rows = []
     for _, r in pf_cur.iterrows():
         p = ly_map.get(r["제휴사"])
@@ -539,7 +750,7 @@ with tab_partner:
     if not qual_partners:
         st.info("선택한 기간에 당월인증거래액이 발생한 제휴사가 없어 리스팅할 제휴사가 없습니다.")
     else:
-        st.subheader("제휴사 선택 → 일자별 상세")
+        sub("제휴사 선택 → 일자별 상세")
         sel_partner = st.selectbox("제휴사", qual_partners)
         pd_cur = A.partner_daily_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, sel_partner, exclude_af=exclude_af)
         show_cols = ["일자", "UV", "인증_전체",
@@ -572,7 +783,7 @@ with tab_cat:
         cat_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, None, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
         cat_ly = pd.merge(cat_cert_ly, cat_all_ly, on="물리대카테", how="outer").fillna(0).set_index("물리대카테")
 
-    st.subheader(f"전체 카테고리 (당월인증거래액 내림차순 · {len(cat)}개)")
+    sub(f"전체 카테고리 (당월인증거래액 내림차순 · {len(cat)}개)")
     rows = []
     for _, r in cat.iterrows():
         p = cat_ly.loc[r["물리대카테"]] if (cat_ly is not None and r["물리대카테"] in cat_ly.index) else None
@@ -610,7 +821,7 @@ with tab_brand:
         br_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, None, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
         br_ly = pd.merge(br_cert_ly, br_all_ly, on="Admin브랜드명", how="outer").fillna(0).set_index("Admin브랜드명")
 
-    st.subheader("브랜드 TOP 25 (당월인증거래액 내림차순)")
+    sub("브랜드 TOP 25 (당월인증거래액 내림차순)")
     rows = []
     for _, r in br.iterrows():
         p = br_ly.loc[r["Admin브랜드명"]] if (br_ly is not None and r["Admin브랜드명"] in br_ly.index) else None
@@ -629,6 +840,25 @@ with tab_brand:
         "전년_all_net": br["Admin브랜드명"].map(br_ly["all_net"]),
     }))})
     st.download_button("⤓ 엑셀 다운로드 (브랜드별, 전년도 원본 포함)", excel_bytes, file_name="브랜드별_실적.xlsx")
+
+# ----------------------------------------------------------------------------------
+# 임원보고용 종합 리포트 (사이드바 상단 - 항상 접근 가능하도록)
+# ----------------------------------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.header("📑 Step 3. 종합 리포트")
+exec_report_bytes = build_exec_report_excel(
+    sel_dates, ly_all_dates, yoy_mode_label,
+    cur_all, prev_all, cur_cert, prev_cert,
+    cert_cur, cert_prev,
+    all_cur_d, all_ly_d, cert_cur_d, cert_ly_d,
+    pf_cur, pf_ly, target_df,
+)
+st.sidebar.download_button(
+    "⤓ 임원보고용 종합 리포트 다운로드",
+    exec_report_bytes,
+    file_name=f"LF몰_일반제휴_종합리포트_{sel_dates[0]:%Y%m%d}~{sel_dates[-1]:%Y%m%d}.xlsx",
+)
+st.sidebar.caption("지표별 실적 요약 · 일자별(신규/윈백/기존)·전년비·목표달성률·MIX · 제휴사별 실적, 순결제 기준 1개 시트")
 
 # ----------------------------------------------------------------------------------
 # 전체 JSON 내보내기 (사이드바 하단)
