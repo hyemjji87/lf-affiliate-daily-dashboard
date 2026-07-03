@@ -160,13 +160,10 @@ ly_amt_data = _load_multi(ly_amt_bytes) if ly_amt_bytes else {"amt": pd.DataFram
 
 ly_all_dates = A.ly_dates(sel_dates, yoy_mode)
 
-# 모집단: 당월인증거래액이 발생한 제휴사 (당해년도 기준)
-partners = A.qualifying_partners(cur_data["amt"], sel_dates)
-ly_partners = A.qualifying_partners(ly_amt_data["amt"], ly_all_dates) if not ly_amt_data["amt"].empty else partners
-
-if not partners:
-    st.warning("선택한 기간에 당월인증거래액이 발생한 제휴사가 없습니다. 날짜 선택을 확인해 주세요.")
-    st.stop()
+# [주의] qual_partners(당월인증거래액>0인 제휴사)는 "제휴사별 실적" 탭에 어떤 제휴사를
+# 리스팅할지 정하는 기준일 뿐이다. UV/인증자수/거래액 등 다른 모든 탭의 집계는 이 리스트로
+# 제한하지 않고 업로드된 전체 제휴사(partners=None) 기준으로 계산한다.
+qual_partners = A.qualifying_partners(cur_data["amt"], sel_dates)
 
 # ----------------------------------------------------------------------------------
 # 헤더
@@ -180,7 +177,8 @@ if not f_ly_amt:
 st.title("📊 LF몰 일반제휴 실적")
 period_txt = f"{sel_dates[0]:%Y-%m-%d} ~ {sel_dates[-1]:%Y-%m-%d}" if len(sel_dates) > 1 else f"{sel_dates[0]:%Y-%m-%d}"
 st.caption(
-    f"분석기간 {period_txt} · 대상 제휴사 {len(partners)}개(당월인증거래액 발생 기준) · "
+    f"분석기간 {period_txt} · UV·인증자수·거래액 등은 전체 제휴사 기준 · "
+    f"제휴사별 실적 탭 리스팅 대상 {len(qual_partners)}개(당월인증거래액 발생 기준) · "
     f"전년 매칭: {yoy_mode_label}" + ("" if not warn_bits else " · ⚠ " + " / ".join(warn_bits))
 )
 
@@ -196,10 +194,10 @@ tab_ov, tab_daily, tab_partner, tab_cat, tab_brand = st.tabs(
 # 개요 탭
 # ====================================================================================
 with tab_ov:
-    uv_cur = A.uv_total(cur_data["uv"], sel_dates, partners, exclude_af=exclude_af)
-    uv_prev = A.uv_total(ly_cert_data["uv"], ly_all_dates, ly_partners) if not ly_cert_data["uv"].empty else None
-    cert_cur = A.cert_summary(cur_data["cert"], sel_dates, partners)
-    cert_prev = A.cert_summary(ly_cert_data["cert"], ly_all_dates, ly_partners) if not ly_cert_data["cert"].empty else {"전체": None, "기존": None, "WIN-BACK": None, "신규": None}
+    uv_cur = A.uv_total(cur_data["uv"], sel_dates, None, exclude_af=exclude_af)
+    uv_prev = A.uv_total(ly_cert_data["uv"], ly_all_dates, None) if not ly_cert_data["uv"].empty else None
+    cert_cur = A.cert_summary(cur_data["cert"], sel_dates, None)
+    cert_prev = A.cert_summary(ly_cert_data["cert"], ly_all_dates, None) if not ly_cert_data["cert"].empty else {"전체": None, "기존": None, "WIN-BACK": None, "신규": None}
 
     c1, c2 = st.columns(2)
     with c1:
@@ -220,8 +218,8 @@ with tab_ov:
     pt = "net" if paytype == "순결제" else "tot"
 
     def _amt_block(label, title):
-        cur = A.amt_summary(cur_data["amt"], sel_dates, partners, cert_only=(label == "당월인증"))
-        prev = (A.amt_summary(ly_amt_data["amt"], ly_all_dates, ly_partners, cert_only=(label == "당월인증"))
+        cur = A.amt_summary(cur_data["amt"], sel_dates, None, cert_only=(label == "당월인증"))
+        prev = (A.amt_summary(ly_amt_data["amt"], ly_all_dates, None, cert_only=(label == "당월인증"))
                 if not ly_amt_data["amt"].empty else {s: {"tot": None, "net": None, "cust_tot": None, "cust_net": None} for s in ["전체"] + A.STATUSES})
         cur_total = cur["전체"][pt]
         prev_total = prev["전체"][pt]
@@ -259,8 +257,8 @@ with tab_ov:
 # 일자별 탭 (화면 = 값 + 전년비만, 전년 원본값은 엑셀에만)
 # ====================================================================================
 with tab_daily:
-    daily_uc = A.daily_uv_cert_table(cur_data["uv"], cur_data["cert"], sel_dates, partners, exclude_af=exclude_af)
-    daily_uc_ly = (A.daily_uv_cert_table(ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, ly_partners)
+    daily_uc = A.daily_uv_cert_table(cur_data["uv"], cur_data["cert"], sel_dates, None, exclude_af=exclude_af)
+    daily_uc_ly = (A.daily_uv_cert_table(ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, None)
                    if (not ly_cert_data["uv"].empty or not ly_cert_data["cert"].empty) else None)
 
     st.subheader("UV")
@@ -289,8 +287,8 @@ with tab_daily:
     ptd = "net" if paytype_d == "순결제" else "tot"
 
     def _daily_amt_block(cert_only, title):
-        cur_d = A.daily_amt_table(cur_data["amt"], sel_dates, partners, cert_only=cert_only)
-        ly_d = (A.daily_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, cert_only=cert_only)
+        cur_d = A.daily_amt_table(cur_data["amt"], sel_dates, None, cert_only=cert_only)
+        ly_d = (A.daily_amt_table(ly_amt_data["amt"], ly_all_dates, None, cert_only=cert_only)
                 if not ly_amt_data["amt"].empty else None)
         st.subheader(f"{title} (전체·신규·윈백·기존)")
         rows = []
@@ -347,8 +345,8 @@ with tab_partner:
     paytype_p = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="partner_paytype")
     ptp = "net" if paytype_p == "순결제" else "tot"
 
-    pf_cur = A.partner_full_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, partners, exclude_af=exclude_af)
-    pf_ly = (A.partner_full_table(ly_amt_data["amt"], ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, ly_partners)
+    pf_cur = A.partner_full_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, qual_partners, exclude_af=exclude_af)
+    pf_ly = (A.partner_full_table(ly_amt_data["amt"], ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, None)
              if not ly_amt_data["amt"].empty else None)
     ly_map = {r["제휴사"]: r for _, r in pf_ly.iterrows()} if pf_ly is not None else {}
 
@@ -380,24 +378,38 @@ with tab_partner:
     st.dataframe(style_delta_cols(df_partner, partner_delta_cols), hide_index=True, use_container_width=True)
     st.caption("전년비는 전년도 동일 제휴사 코호트 기준(전년도 데이터가 없으면 \"신규\" 표기).")
 
-    st.subheader("제휴사 선택 → 일자별 상세")
-    sel_partner = st.selectbox("제휴사", partners)
-    pd_cur = A.partner_daily_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, sel_partner, exclude_af=exclude_af)
-    show_cols = ["일자", "UV", "인증_전체",
-                 f"당월인증_{ptp}", f"전체거래액_{ptp}", f"고객수_{ptp}"]
-    disp = pd_cur[show_cols].rename(columns={
-        "인증_전체": "인증수", f"당월인증_{ptp}": "당월인증거래액",
-        f"전체거래액_{ptp}": "전체거래액", f"고객수_{ptp}": "고객수"})
-    disp["객단가"] = (disp["전체거래액"] / disp["고객수"].replace(0, np.nan)).fillna(0)
-    st.dataframe(disp, hide_index=True, use_container_width=True)
+    pf_ly_idx = pf_ly.set_index("제휴사") if pf_ly is not None else None
 
-    excel_bytes = to_excel_bytes({
-        "제휴사별_순결제": pf_cur.assign(**{f"전년_{c}": pf_ly[c] if pf_ly is not None and c in pf_ly.columns else np.nan
-                                         for c in ["cert_net", "all_net", "cust_net"]}),
-        "제휴사별_총결제": pf_cur.assign(**{f"전년_{c}": pf_ly[c] if pf_ly is not None and c in pf_ly.columns else np.nan
-                                         for c in ["cert_tot", "all_tot", "cust_tot"]}),
-        f"{sel_partner}_일자별": pd_cur,
-    })
+    def _with_ly(df, cols):
+        out = {}
+        for c in cols:
+            if pf_ly_idx is not None and c in pf_ly_idx.columns:
+                out[f"전년_{c}"] = df["제휴사"].map(pf_ly_idx[c])
+            else:
+                out[f"전년_{c}"] = np.nan
+        return df.assign(**out)
+
+    export_sheets = {
+        "제휴사별_순결제": _with_ly(pf_cur, ["cert_net", "all_net", "cust_net"]),
+        "제휴사별_총결제": _with_ly(pf_cur, ["cert_tot", "all_tot", "cust_tot"]),
+    }
+
+    if not qual_partners:
+        st.info("선택한 기간에 당월인증거래액이 발생한 제휴사가 없어 리스팅할 제휴사가 없습니다.")
+    else:
+        st.subheader("제휴사 선택 → 일자별 상세")
+        sel_partner = st.selectbox("제휴사", qual_partners)
+        pd_cur = A.partner_daily_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], sel_dates, sel_partner, exclude_af=exclude_af)
+        show_cols = ["일자", "UV", "인증_전체",
+                     f"당월인증_{ptp}", f"전체거래액_{ptp}", f"고객수_{ptp}"]
+        disp = pd_cur[show_cols].rename(columns={
+            "인증_전체": "인증수", f"당월인증_{ptp}": "당월인증거래액",
+            f"전체거래액_{ptp}": "전체거래액", f"고객수_{ptp}": "고객수"})
+        disp["객단가"] = (disp["전체거래액"] / disp["고객수"].replace(0, np.nan)).fillna(0)
+        st.dataframe(disp, hide_index=True, use_container_width=True)
+        export_sheets[f"{sel_partner}_일자별"] = pd_cur
+
+    excel_bytes = to_excel_bytes(export_sheets)
     st.download_button("⤓ 엑셀 다운로드 (제휴사별, 전년도 원본 포함)", excel_bytes, file_name="제휴사별_실적.xlsx")
 
 # ====================================================================================
@@ -407,15 +419,15 @@ with tab_cat:
     paytype_c = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="cat_paytype")
     ptc = "net" if paytype_c == "순결제" else "tot"
 
-    cat_cert = A.group_amt_table(cur_data["amt"], sel_dates, partners, "물리대카테", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
-    cat_all = A.group_amt_table(cur_data["amt"], sel_dates, partners, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+    cat_cert = A.group_amt_table(cur_data["amt"], sel_dates, None, "물리대카테", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+    cat_all = A.group_amt_table(cur_data["amt"], sel_dates, None, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
     cat = pd.merge(cat_cert, cat_all, on="물리대카테", how="outer").fillna(0)
     cat = cat.sort_values("cert_tot", ascending=False).reset_index(drop=True)
 
     cat_ly = None
     if not ly_amt_data["amt"].empty:
-        cat_cert_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "물리대카테", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
-        cat_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+        cat_cert_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, None, "물리대카테", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+        cat_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, None, "물리대카테", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
         cat_ly = pd.merge(cat_cert_ly, cat_all_ly, on="물리대카테", how="outer").fillna(0).set_index("물리대카테")
 
     st.subheader(f"전체 카테고리 (당월인증거래액 내림차순 · {len(cat)}개)")
@@ -445,15 +457,15 @@ with tab_brand:
     paytype_b = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="brand_paytype")
     ptb = "net" if paytype_b == "순결제" else "tot"
 
-    br_cert = A.group_amt_table(cur_data["amt"], sel_dates, partners, "Admin브랜드명", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
-    br_all = A.group_amt_table(cur_data["amt"], sel_dates, partners, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+    br_cert = A.group_amt_table(cur_data["amt"], sel_dates, None, "Admin브랜드명", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+    br_all = A.group_amt_table(cur_data["amt"], sel_dates, None, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
     br = pd.merge(br_cert, br_all, on="Admin브랜드명", how="outer").fillna(0)
     br = br.sort_values("cert_tot", ascending=False).head(25).reset_index(drop=True)
 
     br_ly = None
     if not ly_amt_data["amt"].empty:
-        br_cert_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "Admin브랜드명", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
-        br_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, ly_partners, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
+        br_cert_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, None, "Admin브랜드명", cert_only=True).rename(columns={"tot": "cert_tot", "net": "cert_net"})
+        br_all_ly = A.group_amt_table(ly_amt_data["amt"], ly_all_dates, None, "Admin브랜드명", cert_only=False).rename(columns={"tot": "all_tot", "net": "all_net"})
         br_ly = pd.merge(br_cert_ly, br_all_ly, on="Admin브랜드명", how="outer").fillna(0).set_index("Admin브랜드명")
 
     st.subheader("브랜드 TOP 25 (당월인증거래액 내림차순)")
@@ -483,9 +495,9 @@ st.sidebar.divider()
 if st.sidebar.button("⤓ 현재 화면 JSON 스냅샷 만들기"):
     snapshot = {
         "기간": [str(d) for d in sel_dates],
-        "제휴사": partners,
-        "UV": uv_cur,
-        "인증자수": cert_cur,
+        "UV(전체 제휴사 기준)": uv_cur,
+        "인증자수(전체 제휴사 기준)": cert_cur,
+        "제휴사별_실적_탭_리스팅_대상(당월인증거래액>0)": qual_partners,
     }
     import json
     st.sidebar.download_button("JSON 다운로드", json.dumps(snapshot, ensure_ascii=False, indent=2),
