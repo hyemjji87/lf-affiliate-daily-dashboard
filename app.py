@@ -75,18 +75,26 @@ def pct_ratio(cur, prev):
 
 
 def target_ratio(cur, target):
-    """목표비: pct_ratio와 동일한 서식(▼달성/초과, △미달)을 쓰되, 목표가 아예 없는 경우
-    ('신규'가 아니라) 항상 '-'로 표기한다."""
-    if target is None:
+    """목표비: 전년비와 같은 색상/기호(▼달성·초과 = 초록, △미달 = 빨강)를 쓰되,
+    표시값은 '증감률'이 아니라 실적/목표 그대로의 달성률(%)이다 (예: 95% 달성 -> "△95%").
+    목표가 아예 없으면(목표 파일에 해당 일자가 없으면) '-'로 표기한다."""
+    if (target is None or (isinstance(target, float) and pd.isna(target)) or target == 0
+            or cur is None or (isinstance(cur, float) and pd.isna(cur))):
         return "-", "muted", None
-    return pct_ratio(cur, target)
+    ratio = cur / target
+    pct = round(ratio * 100)
+    if pct < 100:
+        return f"△{pct}%", "danger", ratio
+    return f"▼{pct}%", "success", ratio
 
 
 COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "accent": "#0969da"}
 
 
-def style_delta_cols(df: pd.DataFrame, delta_cols: list):
-    """Δ로 표기된 컬럼(문자열: '▼12%' / '△5%' / '신규' / '-')에 색을 입힌 Styler 반환."""
+def style_delta_cols(df: pd.DataFrame, delta_cols: list | None = None):
+    """Δ로 표기된 컬럼(문자열: '▼12%' / '△5%' / '신규' / '-')에 색을 입힌 Styler 반환.
+    delta_cols=None 이면 컬럼 전체에 적용한다(멀티인덱스 컬럼 등 subset 지정이 번거로운 경우용 -
+    _color는 ▼/△/신규 표기가 아닌 값에는 항상 빈 스타일을 반환하므로 전체 적용해도 안전하다)."""
     def _color(v):
         if isinstance(v, str) and v.startswith("▼"):
             return f"color:{COLOR_MAP['success']};font-weight:600"
@@ -95,6 +103,8 @@ def style_delta_cols(df: pd.DataFrame, delta_cols: list):
         if v == "신규":
             return f"color:{COLOR_MAP['accent']};font-weight:600"
         return ""
+    if delta_cols is None:
+        return df.style.map(_color)
     return df.style.map(_color, subset=delta_cols)
 
 
@@ -316,9 +326,11 @@ with tab_daily:
             pv = pr[col] if pr is not None else None
             row += [fmt(r[col]), pct_ratio(r[col], pv)[0]]
         cert_rows.append(row)
-    cert_delta_cols = ["전체 전년비", "신규 전년비", "윈백 전년비", "기존 전년비"]
-    df_cert = pd.DataFrame(cert_rows, columns=["일자", "전체", "전체 전년비", "신규", "신규 전년비", "윈백", "윈백 전년비", "기존", "기존 전년비"])
-    st.dataframe(style_delta_cols(df_cert, cert_delta_cols), hide_index=True, use_container_width=True)
+    cert_cols = pd.MultiIndex.from_tuples(
+        [("", "일자")] + [t for s in ["전체", "신규", "윈백", "기존"] for t in [(s, "인증수"), (s, "전년비")]]
+    )
+    df_cert = pd.DataFrame(cert_rows, columns=cert_cols)
+    st.dataframe(style_delta_cols(df_cert), hide_index=True, use_container_width=True)
 
     paytype_d = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="daily_paytype")
     ptd = "net" if paytype_d == "순결제" else "tot"
@@ -345,16 +357,14 @@ with tab_daily:
                     t, _, _ = target_ratio(c, tgt_v)
                     row.append(t)
             rows.append(row)
-        cols = ["일자"]
-        delta_cols = []
+        col_tuples = [("", "일자")]
         for s in ["전체", "신규", "윈백", "기존"]:
-            cols += [s, f"{s} 전년비"]
-            delta_cols.append(f"{s} 전년비")
+            col_tuples.append((s, "실적"))
+            col_tuples.append((s, "전년비"))
             if show_target:
-                cols.append(f"{s} 목표비")
-                delta_cols.append(f"{s} 목표비")
-        df = pd.DataFrame(rows, columns=cols)
-        st.dataframe(style_delta_cols(df, delta_cols), hide_index=True, use_container_width=True)
+                col_tuples.append((s, "목표비"))
+        df = pd.DataFrame(rows, columns=pd.MultiIndex.from_tuples(col_tuples))
+        st.dataframe(style_delta_cols(df), hide_index=True, use_container_width=True)
         return cur_d, ly_d
 
     all_cur_d, all_ly_d = _daily_amt_block(False, "전체거래액")
