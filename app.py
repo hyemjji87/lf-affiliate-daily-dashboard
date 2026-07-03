@@ -281,8 +281,9 @@ with tab_daily:
             pv = pr[col] if pr is not None else None
             row += [fmt(r[col]), pct_ratio(r[col], pv)[0]]
         cert_rows.append(row)
-    df_cert = pd.DataFrame(cert_rows, columns=["일자", "전체", "Δ", "신규", "Δ", "윈백", "Δ", "기존", "Δ"])
-    st.dataframe(style_delta_cols(df_cert, ["Δ"]), hide_index=True, use_container_width=True)
+    cert_delta_cols = ["전체 Δ", "신규 Δ", "윈백 Δ", "기존 Δ"]
+    df_cert = pd.DataFrame(cert_rows, columns=["일자", "전체", "전체 Δ", "신규", "신규 Δ", "윈백", "윈백 Δ", "기존", "기존 Δ"])
+    st.dataframe(style_delta_cols(df_cert, cert_delta_cols), hide_index=True, use_container_width=True)
 
     paytype_d = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="daily_paytype")
     ptd = "net" if paytype_d == "순결제" else "tot"
@@ -303,10 +304,12 @@ with tab_daily:
                 row += [fmt(c), pct_ratio(c, p)[0]]
             rows.append(row)
         cols = ["일자"]
+        delta_cols = []
         for s in ["전체", "신규", "윈백", "기존"]:
-            cols += [s, "Δ"]
+            cols += [s, f"{s} Δ"]
+            delta_cols.append(f"{s} Δ")
         df = pd.DataFrame(rows, columns=cols)
-        st.dataframe(style_delta_cols(df, ["Δ"]), hide_index=True, use_container_width=True)
+        st.dataframe(style_delta_cols(df, delta_cols), hide_index=True, use_container_width=True)
         return cur_d, ly_d
 
     all_cur_d, all_ly_d = _daily_amt_block(False, "전체거래액")
@@ -323,8 +326,8 @@ with tab_daily:
             cust_p = pr[f"전체_cust_{ptd}"] if pr is not None else None
             aov_p = (pr[f"전체_{ptd}"] / cust_p) if (pr is not None and cust_p) else None
             rows.append([r["일자"], fmt(cust_c), pct_ratio(cust_c, cust_p)[0], fmt(aov_c), pct_ratio(aov_c, aov_p)[0]])
-        df = pd.DataFrame(rows, columns=["일자", "고객수", "Δ", "객단가", "Δ"])
-        st.dataframe(style_delta_cols(df, ["Δ"]), hide_index=True, use_container_width=True)
+        df = pd.DataFrame(rows, columns=["일자", "고객수", "고객수 Δ", "객단가", "객단가 Δ"])
+        st.dataframe(style_delta_cols(df, ["고객수 Δ", "객단가 Δ"]), hide_index=True, use_container_width=True)
 
     _daily_cust_aov(cert_cur_d, cert_ly_d, "고객수 · 객단가 (당월인증 기준)")
     _daily_cust_aov(all_cur_d, all_ly_d, "고객수 · 객단가 (전체거래액 기준)")
@@ -370,9 +373,11 @@ with tab_partner:
             fmt(cust_c), pct_ratio(cust_c, cust_p)[0],
             fmt(aov_c), pct_ratio(aov_c, aov_p)[0],
         ])
-    cols = ["제휴사", "UV", "Δ", "인증수", "Δ", "당월인증거래액", "Δ", "전체거래액", "Δ", "고객수", "Δ", "객단가", "Δ"]
+    cols = ["제휴사", "UV", "UV Δ", "인증수", "인증수 Δ", "당월인증거래액", "당월인증거래액 Δ",
+            "전체거래액", "전체거래액 Δ", "고객수", "고객수 Δ", "객단가", "객단가 Δ"]
+    partner_delta_cols = ["UV Δ", "인증수 Δ", "당월인증거래액 Δ", "전체거래액 Δ", "고객수 Δ", "객단가 Δ"]
     df_partner = pd.DataFrame(rows, columns=cols)
-    st.dataframe(style_delta_cols(df_partner, ["Δ"]), hide_index=True, use_container_width=True)
+    st.dataframe(style_delta_cols(df_partner, partner_delta_cols), hide_index=True, use_container_width=True)
     st.caption("전년비는 전년도 동일 제휴사 코호트 기준(전년도 데이터가 없으면 \"신규\" 표기).")
 
     st.subheader("제휴사 선택 → 일자별 상세")
@@ -384,7 +389,7 @@ with tab_partner:
         "인증_전체": "인증수", f"당월인증_{ptp}": "당월인증거래액",
         f"전체거래액_{ptp}": "전체거래액", f"고객수_{ptp}": "고객수"})
     disp["객단가"] = (disp["전체거래액"] / disp["고객수"].replace(0, np.nan)).fillna(0)
-    st.dataframe(disp.applymap(lambda v: fmt(v) if isinstance(v, (int, float, np.floating)) else v) if False else disp, hide_index=True, use_container_width=True)
+    st.dataframe(disp, hide_index=True, use_container_width=True)
 
     excel_bytes = to_excel_bytes({
         "제휴사별_순결제": pf_cur.assign(**{f"전년_{c}": pf_ly[c] if pf_ly is not None and c in pf_ly.columns else np.nan
@@ -421,8 +426,8 @@ with tab_cat:
         cert_p = p[f"cert_{ptc}"] if p is not None else None
         all_p = p[f"all_{ptc}"] if p is not None else None
         rows.append([r["물리대카테"], fmt(cert_c), pct_ratio(cert_c, cert_p)[0], fmt(all_c), pct_ratio(all_c, all_p)[0]])
-    df_cat = pd.DataFrame(rows, columns=["카테고리", "당월인증거래액", "Δ", "전체거래액", "Δ"])
-    st.dataframe(style_delta_cols(df_cat, ["Δ"]), hide_index=True, use_container_width=True)
+    df_cat = pd.DataFrame(rows, columns=["카테고리", "당월인증거래액", "당월인증거래액 Δ", "전체거래액", "전체거래액 Δ"])
+    st.dataframe(style_delta_cols(df_cat, ["당월인증거래액 Δ", "전체거래액 Δ"]), hide_index=True, use_container_width=True)
     st.caption("전년도 원본 값은 엑셀 다운로드에 포함됩니다.")
 
     excel_bytes = to_excel_bytes({"카테고리별": cat.assign(**({} if cat_ly is None else {
@@ -459,8 +464,8 @@ with tab_brand:
         cert_p = p[f"cert_{ptb}"] if p is not None else None
         all_p = p[f"all_{ptb}"] if p is not None else None
         rows.append([r["Admin브랜드명"], fmt(cert_c), pct_ratio(cert_c, cert_p)[0], fmt(all_c), pct_ratio(all_c, all_p)[0]])
-    df_br = pd.DataFrame(rows, columns=["브랜드", "당월인증거래액", "Δ", "전체거래액", "Δ"])
-    st.dataframe(style_delta_cols(df_br, ["Δ"]), hide_index=True, use_container_width=True)
+    df_br = pd.DataFrame(rows, columns=["브랜드", "당월인증거래액", "당월인증거래액 Δ", "전체거래액", "전체거래액 Δ"])
+    st.dataframe(style_delta_cols(df_br, ["당월인증거래액 Δ", "전체거래액 Δ"]), hide_index=True, use_container_width=True)
     st.caption("전년도 원본 값은 엑셀 다운로드에 포함됩니다.")
 
     excel_bytes = to_excel_bytes({"브랜드별_TOP25": br.assign(**({} if br_ly is None else {
