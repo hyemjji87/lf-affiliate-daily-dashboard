@@ -26,6 +26,10 @@ import lf_analysis as A
 
 st.set_page_config(page_title="LF몰 일반제휴 실적", page_icon="📊", layout="wide")
 
+# HTML 내보내기용: 화면에 그려지는 표/카드 HTML을 순서대로 모아뒀다가 사이드바의
+# "HTML로 내보내기" 버튼에서 하나의 정적 HTML 문서로 합친다.
+EXPORT_BLOCKS: list[str] = []
+
 # 일자별 목표(순결제 기준) 파일 - 연말까지 고정값이라 업로드 대신 리포에 고정 파일로 관리한다.
 # 목표가 갱신되면 이 파일(target_data.xlsx)만 교체하면 된다 (별도 요청 시 반영).
 TARGET_FILE = os.path.join(os.path.dirname(__file__), "target_data.xlsx")
@@ -63,8 +67,9 @@ def fmt(n):
 def sub(title: str):
     """st.subheader는 표 폰트(13px) 대비 지나치게 크므로, 표보다는 크되 절제된 크기의
     섹션 제목으로 대체."""
-    st.markdown(f"<div style='font-size:16px;font-weight:700;margin:18px 0 6px;'>{title}</div>",
-                unsafe_allow_html=True)
+    html = f"<div style='font-size:16px;font-weight:700;margin:18px 0 6px;'>{title}</div>"
+    st.markdown(html, unsafe_allow_html=True)
+    EXPORT_BLOCKS.append(html)
 
 
 def pct_ratio(cur, prev):
@@ -94,6 +99,17 @@ def target_ratio(cur, target):
 
 
 COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "accent": "#0969da"}
+
+
+def md(html: str):
+    """unsafe_allow_html 표/카드 HTML을 화면에 출력하면서 동시에 HTML 내보내기용으로 모아둔다."""
+    st.markdown(html, unsafe_allow_html=True)
+    EXPORT_BLOCKS.append(html)
+
+
+def export_only(html: str):
+    """화면에는 표시하지 않고 HTML 내보내기 문서에만 들어갈 구획(탭 제목 등)을 추가한다."""
+    EXPORT_BLOCKS.append(html)
 
 
 def render_grouped_table(header_groups: list, rows: list, color_rows: list | None = None, first_col_label: str = "일자"):
@@ -169,6 +185,28 @@ def render_simple_table(columns: list, rows: list, color_rows: list | None = Non
         '</table></div>'
     )
     return html
+
+
+def render_kpi_cards(cards: list) -> str:
+    """개요 탭 상단 KPI 카드(UV·인증자수·전체거래액·당월인증거래액)를 렌더링.
+    cards: [(label, value_str, yoy_str, yoy_color_key, target_str, target_color_key), ...]
+    """
+    cells = []
+    for label, val, yoy, yoy_c, tgt, tgt_c in cards:
+        yoy_css = f"color:{COLOR_MAP.get(yoy_c, '#24292f')};font-weight:600;"
+        tgt_css = f"color:{COLOR_MAP.get(tgt_c, '#24292f')};font-weight:600;"
+        cells.append(
+            '<div style="flex:1;min-width:180px;border:1px solid #e1e4e8;border-radius:8px;'
+            'padding:14px 16px;background:#fff;">'
+            f'<div style="font-size:13px;color:#6e7781;margin-bottom:4px;">{label}</div>'
+            f'<div style="font-size:22px;font-weight:700;">{val}</div>'
+            '<div style="font-size:12px;margin-top:6px;white-space:nowrap;">'
+            f'<span style="{yoy_css}">전년비 {yoy}</span>'
+            "&nbsp;·&nbsp;"
+            f'<span style="{tgt_css}">목표비 {tgt}</span>'
+            "</div></div>"
+        )
+    return f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 20px;">{"".join(cells)}</div>'
 
 
 # ----------------------------------------------------------------------------------
@@ -284,16 +322,36 @@ tab_ov, tab_daily, tab_partner, tab_cat, tab_brand = st.tabs(
 # 개요 탭
 # ====================================================================================
 with tab_ov:
+    export_only('<h2 style="font-size:20px;font-weight:700;margin:0 0 12px;">개요</h2>')
+
     uv_cur = A.uv_total(cur_data["uv"], sel_dates, None, exclude_af=exclude_af)
     uv_prev = A.uv_total(ly_cert_data["uv"], ly_all_dates, None) if not ly_cert_data["uv"].empty else None
     cert_cur = A.cert_summary(cur_data["cert"], sel_dates, None)
     cert_prev = A.cert_summary(ly_cert_data["cert"], ly_all_dates, None) if not ly_cert_data["cert"].empty else {"전체": None, "기존": None, "WIN-BACK": None, "신규": None}
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("UV", fmt(uv_cur), pct_ratio(uv_cur, uv_prev)[0])
-    with c2:
-        st.metric("인증자수", fmt(cert_cur["전체"]), pct_ratio(cert_cur["전체"], cert_prev["전체"])[0])
+    # KPI 카드는 결제 구분 토글과 무관하게 항상 순결제 기준 (전체거래액·당월인증거래액)
+    kpi_all_net_cur = A.amt_summary(cur_data["amt"], sel_dates, None, cert_only=False)["전체"]["net"]
+    kpi_all_net_prev = (A.amt_summary(ly_amt_data["amt"], ly_all_dates, None, cert_only=False)["전체"]["net"]
+                        if not ly_amt_data["amt"].empty else None)
+    kpi_cert_net_cur = A.amt_summary(cur_data["amt"], sel_dates, None, cert_only=True)["전체"]["net"]
+    kpi_cert_net_prev = (A.amt_summary(ly_amt_data["amt"], ly_all_dates, None, cert_only=True)["전체"]["net"]
+                        if not ly_amt_data["amt"].empty else None)
+    kpi_all_net_tgt = A.target_sum(target_df, sel_dates, "all", "total")
+    kpi_cert_net_tgt = A.target_sum(target_df, sel_dates, "cert", "total")
+
+    sub("핵심 지표 (KPI)")
+    kpi_defs = [
+        ("UV", uv_cur, uv_prev, None),
+        ("인증자수", cert_cur["전체"], cert_prev["전체"], None),
+        ("전체거래액 (순결제)", kpi_all_net_cur, kpi_all_net_prev, kpi_all_net_tgt),
+        ("당월인증거래액 (순결제)", kpi_cert_net_cur, kpi_cert_net_prev, kpi_cert_net_tgt),
+    ]
+    kpi_cards = []
+    for label, cur_v, prev_v, tgt_v in kpi_defs:
+        d_disp, d_color, _ = pct_ratio(cur_v, prev_v)
+        t_disp, t_color, _ = target_ratio(cur_v, tgt_v)
+        kpi_cards.append((label, fmt(cur_v), d_disp, d_color, t_disp, t_color))
+    md(render_kpi_cards(kpi_cards))
 
     sub("인증자수 구성 (비중은 기준일 기준)")
     rows, color_rows = [], []
@@ -302,7 +360,7 @@ with tab_ov:
         d, d_color, _ = pct_ratio(cert_cur[k], cert_prev.get(k))
         rows.append([label, fmt(cert_cur[k]), share, d])
         color_rows.append([None, None, d_color])
-    st.markdown(render_simple_table(["구분", "기준일", "비중", "전년비"], rows, color_rows), unsafe_allow_html=True)
+    md(render_simple_table(["구분", "기준일", "비중", "전년비"], rows, color_rows))
 
     paytype = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="ov_paytype")
     pt = "net" if paytype == "순결제" else "tot"
@@ -317,14 +375,16 @@ with tab_ov:
         show_target = pt == "net" and not target_df.empty
         group = "cert" if label == "당월인증" else "all"
         d_all_css = f"color:{COLOR_MAP.get(d_all_color, '#000')};font-weight:600" if d_all_color in COLOR_MAP else ""
-        header = (f"**{title}**  \n### {fmt(cur_total)}  "
-                  f"<span style='font-size:13px;{d_all_css}'>전년비 {d_all}</span>")
+        header = (f'<div style="font-size:14px;font-weight:600;margin-top:6px;">{title}</div>'
+                  f'<div style="font-size:26px;font-weight:700;">{fmt(cur_total)}  '
+                  f'<span style="font-size:13px;{d_all_css}">전년비 {d_all}</span>')
         if show_target:
             tgt_total = A.target_sum(target_df, sel_dates, group, "total")
             t_all, t_all_color, _ = target_ratio(cur_total, tgt_total)
             t_all_css = f"color:{COLOR_MAP.get(t_all_color, '#000')};font-weight:600" if t_all_color in COLOR_MAP else ""
-            header += f"  <span style='font-size:13px;{t_all_css}'>목표비 {t_all}</span>"
-        st.markdown(header, unsafe_allow_html=True)
+            header += f'  <span style="font-size:13px;{t_all_css}">목표비 {t_all}</span>'
+        header += "</div>"
+        md(header)
         rows, color_rows = [], []
         status_target_key = {"신규": "신규", "WIN-BACK": "윈백", "기존": "기존"}
         for k, lbl in [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]:
@@ -342,7 +402,7 @@ with tab_ov:
             rows.append(row)
             color_rows.append(color_row)
         cols = ["구분", "기준일", "비중", "전년비"] + (["목표비"] if show_target else [])
-        st.markdown(render_simple_table(cols, rows, color_rows), unsafe_allow_html=True)
+        md(render_simple_table(cols, rows, color_rows))
         return cur, prev
 
     cur_all, prev_all = _amt_block("전체", "전체거래액")
@@ -357,15 +417,35 @@ with tab_ov:
         d2, c2, _ = pct_ratio(aov_c, aov_p)
         rows = [["고객수", fmt(cust_c), d1], ["객단가", fmt(aov_c), d2]]
         color_rows = [[None, c1], [None, c2]]
-        st.markdown(render_simple_table(["구분", "기준일", "전년비"], rows, color_rows), unsafe_allow_html=True)
+        md(render_simple_table(["구분", "기준일", "전년비"], rows, color_rows))
 
     _cust_aov_table(cur_all, prev_all, "전체 고객수 · 객단가")
     _cust_aov_table(cur_cert, prev_cert, "당월인증 고객수 · 객단가")
+
+    sub("요일별 평균 거래액 (당년 실적 기준, 월별)")
+    wd_groups = [("거래액", ["총결제", "순결제"]), ("당월인증거래액", ["총결제", "순결제"])]
+    avail_months = sorted(set((d.year, d.month) for d in available_dates))
+    for y, m in avail_months:
+        month_dates = [d for d in available_dates if d.year == y and d.month == m]
+        wd_all = A.weekday_avg_amt_table(cur_data["amt"], month_dates, cert_only=False)
+        wd_cert = A.weekday_avg_amt_table(cur_data["amt"], month_dates, cert_only=True)
+        wd_rows = []
+        for i in range(len(wd_all)):
+            ra, rc = wd_all.iloc[i], wd_cert.iloc[i]
+            wd_rows.append([
+                ra["요일"], fmt(ra["avg_tot"]), fmt(ra["avg_net"]),
+                fmt(rc["avg_tot"]), fmt(rc["avg_net"]),
+            ])
+        sub(f"{str(y)[2:]}{m:02d} 요일별 평균")
+        md(render_grouped_table(wd_groups, wd_rows, first_col_label="요일"))
+    st.caption("집계기간: 업로드된 당해년도 실적 전체 (월별 구분), 사이드바 날짜 선택과 무관")
 
 # ====================================================================================
 # 일자별 탭 (화면 = 값 + 전년비만, 전년 원본값은 엑셀에만)
 # ====================================================================================
 with tab_daily:
+    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
+                'border-top:2px solid #d0d7de;padding-top:20px;">일자별</h2>')
     daily_uc = A.daily_uv_cert_table(cur_data["uv"], cur_data["cert"], sel_dates, None, exclude_af=exclude_af)
     daily_uc_ly = (A.daily_uv_cert_table(ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, None)
                    if (not ly_cert_data["uv"].empty or not ly_cert_data["cert"].empty) else None)
@@ -377,7 +457,12 @@ with tab_daily:
         disp, color, _ = pct_ratio(daily_uc.iloc[i]["UV"], prev_v)
         uv_rows.append([d.strftime("%Y-%m-%d"), fmt(daily_uc.iloc[i]["UV"]), disp])
         uv_color_rows.append([None, color])
-    st.markdown(render_simple_table(["일자", "UV", "전년비"], uv_rows, uv_color_rows), unsafe_allow_html=True)
+    uv_total_cur = daily_uc["UV"].sum()
+    uv_total_prev = daily_uc_ly["UV"].sum() if daily_uc_ly is not None else None
+    uv_t_disp, uv_t_color, _ = pct_ratio(uv_total_cur, uv_total_prev)
+    uv_rows.append(["<b>합계</b>", f"<b>{fmt(uv_total_cur)}</b>", f"<b>{uv_t_disp}</b>"])
+    uv_color_rows.append([None, uv_t_color])
+    md(render_simple_table(["일자", "UV", "전년비"], uv_rows, uv_color_rows))
 
     sub("인증자수 (전체·신규·윈백·기존)")
     cert_rows, cert_color_rows = [], []
@@ -393,8 +478,18 @@ with tab_daily:
             color_row += [None, d_color]
         cert_rows.append(row)
         cert_color_rows.append(color_row)
+    cert_total_row = ["<b>합계</b>"]
+    cert_total_color_row = []
+    for col in ["인증_전체", "인증_신규", "인증_윈백", "인증_기존"]:
+        cur_sum = daily_uc[col].sum()
+        prev_sum = daily_uc_ly[col].sum() if daily_uc_ly is not None else None
+        d_disp, d_color, _ = pct_ratio(cur_sum, prev_sum)
+        cert_total_row += [f"<b>{fmt(cur_sum)}</b>", f"<b>{d_disp}</b>"]
+        cert_total_color_row += [None, d_color]
+    cert_rows.append(cert_total_row)
+    cert_color_rows.append(cert_total_color_row)
     cert_groups = [(s, ["인증수", "전년비"]) for s in ["전체", "신규", "윈백", "기존"]]
-    st.markdown(render_grouped_table(cert_groups, cert_rows, cert_color_rows), unsafe_allow_html=True)
+    md(render_grouped_table(cert_groups, cert_rows, cert_color_rows))
 
     paytype_d = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="daily_paytype")
     ptd = "net" if paytype_d == "순결제" else "tot"
@@ -426,9 +521,24 @@ with tab_daily:
                     color_row.append(t_color)
             rows.append(row)
             color_rows.append(color_row)
+        total_row = ["<b>합계</b>"]
+        total_color_row = []
+        for s in ["전체"] + A.STATUSES:
+            cur_sum = cur_d[f"{s}_{ptd}"].sum()
+            prev_sum = ly_d[f"{s}_{ptd}"].sum() if ly_d is not None else None
+            d_disp, d_color, _ = pct_ratio(cur_sum, prev_sum)
+            total_row += [f"<b>{fmt(cur_sum)}</b>", f"<b>{d_disp}</b>"]
+            total_color_row += [None, d_color]
+            if show_target:
+                tgt_v = A.target_sum(target_df, sel_dates, group, status_target_key[s])
+                t_disp, t_color, _ = target_ratio(cur_sum, tgt_v)
+                total_row.append(f"<b>{t_disp}</b>")
+                total_color_row.append(t_color)
+        rows.append(total_row)
+        color_rows.append(total_color_row)
         subcols = ["실적", "전년비"] + (["목표비"] if show_target else [])
         groups = [(s, subcols) for s in ["전체", "신규", "윈백", "기존"]]
-        st.markdown(render_grouped_table(groups, rows, color_rows), unsafe_allow_html=True)
+        md(render_grouped_table(groups, rows, color_rows))
         return cur_d, ly_d
 
     all_cur_d, all_ly_d = _daily_amt_block(False, "전체거래액")
@@ -448,8 +558,19 @@ with tab_daily:
             d2, c2, _ = pct_ratio(aov_c, aov_p)
             rows.append([r["일자"].strftime("%Y-%m-%d"), fmt(cust_c), d1, fmt(aov_c), d2])
             color_rows.append([None, c1, None, c2])
+        cust_total_cur = cur_d[f"전체_cust_{ptd}"].sum()
+        cust_total_prev = ly_d[f"전체_cust_{ptd}"].sum() if ly_d is not None else None
+        amt_total_cur = cur_d[f"전체_{ptd}"].sum()
+        amt_total_prev = ly_d[f"전체_{ptd}"].sum() if ly_d is not None else None
+        aov_total_cur = amt_total_cur / cust_total_cur if cust_total_cur else 0
+        aov_total_prev = (amt_total_prev / cust_total_prev) if (ly_d is not None and cust_total_prev) else None
+        td1, tc1, _ = pct_ratio(cust_total_cur, cust_total_prev)
+        td2, tc2, _ = pct_ratio(aov_total_cur, aov_total_prev)
+        rows.append(["<b>합계</b>", f"<b>{fmt(cust_total_cur)}</b>", f"<b>{td1}</b>",
+                     f"<b>{fmt(aov_total_cur)}</b>", f"<b>{td2}</b>"])
+        color_rows.append([None, tc1, None, tc2])
         groups = [("고객수", ["실적", "전년비"]), ("객단가", ["실적", "전년비"])]
-        st.markdown(render_grouped_table(groups, rows, color_rows, first_col_label="일자"), unsafe_allow_html=True)
+        md(render_grouped_table(groups, rows, color_rows, first_col_label="일자"))
 
     _daily_cust_aov(cert_cur_d, cert_ly_d, "고객수 · 객단가 (당월인증 기준)")
     _daily_cust_aov(all_cur_d, all_ly_d, "고객수 · 객단가 (전체거래액 기준)")
@@ -458,6 +579,8 @@ with tab_daily:
 # 제휴사별 실적 탭
 # ====================================================================================
 with tab_partner:
+    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
+                'border-top:2px solid #d0d7de;padding-top:20px;">제휴사별 실적</h2>')
     paytype_p = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="partner_paytype")
     ptp = "net" if paytype_p == "순결제" else "tot"
 
@@ -491,7 +614,7 @@ with tab_partner:
         ])
         color_rows.append([None, c_uv, None, c_cert, None, c_certamt, None, c_all, None, c_cust, None, c_aov])
     partner_groups = [(g, ["실적", "전년비"]) for g in ["UV", "인증수", "당월인증거래액", "전체거래액", "고객수", "객단가"]]
-    st.markdown(render_grouped_table(partner_groups, rows, color_rows, first_col_label="제휴사"), unsafe_allow_html=True)
+    md(render_grouped_table(partner_groups, rows, color_rows, first_col_label="제휴사"))
     st.caption("전년비는 전년도 동일 제휴사 코호트 기준(전년도 데이터가 없으면 \"신규\" 표기).")
 
     if not qual_partners:
@@ -512,14 +635,16 @@ with tab_partner:
                 r["일자"].strftime("%Y-%m-%d"), fmt(r["UV"]), fmt(r["인증수"]),
                 fmt(r["당월인증거래액"]), fmt(r["전체거래액"]), fmt(r["고객수"]), fmt(r["객단가"]),
             ])
-        st.markdown(render_simple_table(
+        md(render_simple_table(
             ["일자", "UV", "인증수", "당월인증거래액", "전체거래액", "고객수", "객단가"], detail_rows,
-        ), unsafe_allow_html=True)
+        ))
 
 # ====================================================================================
 # 카테고리별 실적 탭
 # ====================================================================================
 with tab_cat:
+    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
+                'border-top:2px solid #d0d7de;padding-top:20px;">카테고리별 실적</h2>')
     paytype_c = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="cat_paytype")
     ptc = "net" if paytype_c == "순결제" else "tot"
 
@@ -546,12 +671,14 @@ with tab_cat:
         rows.append([r["물리대카테"], fmt(cert_c), d_cert, fmt(all_c), d_all])
         color_rows.append([None, c_cert, None, c_all])
     cat_groups = [("당월인증거래액", ["실적", "전년비"]), ("전체거래액", ["실적", "전년비"])]
-    st.markdown(render_grouped_table(cat_groups, rows, color_rows, first_col_label="카테고리"), unsafe_allow_html=True)
+    md(render_grouped_table(cat_groups, rows, color_rows, first_col_label="카테고리"))
 
 # ====================================================================================
 # 브랜드별 실적 탭
 # ====================================================================================
 with tab_brand:
+    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
+                'border-top:2px solid #d0d7de;padding-top:20px;">브랜드별 실적</h2>')
     paytype_b = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="brand_paytype")
     ptb = "net" if paytype_b == "순결제" else "tot"
 
@@ -578,13 +705,30 @@ with tab_brand:
         rows.append([r["Admin브랜드명"], fmt(cert_c), d_cert, fmt(all_c), d_all])
         color_rows.append([None, c_cert, None, c_all])
     br_groups = [("당월인증거래액", ["실적", "전년비"]), ("전체거래액", ["실적", "전년비"])]
-    st.markdown(render_grouped_table(br_groups, rows, color_rows, first_col_label="브랜드"), unsafe_allow_html=True)
+    md(render_grouped_table(br_groups, rows, color_rows, first_col_label="브랜드"))
 
 # ----------------------------------------------------------------------------------
-# 전체 JSON 내보내기 (사이드바 하단)
+# 내보내기 (사이드바 하단)
 # ----------------------------------------------------------------------------------
 st.sidebar.divider()
-if st.sidebar.button("⤓ 현재 화면 JSON 스냅샷 만들기"):
+st.sidebar.header("⤓ Step 3. 내보내기")
+
+if st.sidebar.button("HTML로 내보내기"):
+    export_html = (
+        "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+        f"<title>LF몰 일반제휴 실적 - {period_txt}</title>"
+        "<style>body{font-family:-apple-system,'Malgun Gothic',sans-serif;"
+        "max-width:1100px;margin:24px auto;padding:0 16px;color:#1f2328;background:#fff;}"
+        "</style></head><body>"
+        "<h1 style='font-size:24px;margin-bottom:4px;'>📊 LF몰 일반제휴 실적</h1>"
+        f"<p style='color:#57606a;margin-top:0;'>분석기간 {period_txt} · 전년 매칭: {yoy_mode_label}</p>"
+        + "".join(EXPORT_BLOCKS)
+        + "</body></html>"
+    )
+    st.sidebar.download_button("HTML 다운로드", export_html,
+                                file_name="lf_affiliate_report.html", mime="text/html")
+
+if st.sidebar.button("현재 화면 JSON 스냅샷 만들기"):
     snapshot = {
         "기간": [str(d) for d in sel_dates],
         "UV(전체 제휴사 기준)": uv_cur,

@@ -251,6 +251,38 @@ def daily_amt_table(amt_df, dates, partners=None, cert_only=False) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
+WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def weekday_avg_amt_table(amt_df, dates, cert_only=False) -> pd.DataFrame:
+    """dates 범위 내 데이터를 요일별로 묶어 하루 평균 총결제/순결제 거래액을 계산한다.
+    분모는 해당 요일이 dates 안에 등장한 일수(같은 요일이 여러 번 있으면 평균에 반영)."""
+    weekday_counts = {}
+    for d in dates:
+        weekday_counts[d.weekday()] = weekday_counts.get(d.weekday(), 0) + 1
+
+    sub = _filter_amt(amt_df, dates, None, cert_only)
+    tot_by_wd, net_by_wd = {}, {}
+    if not sub.empty:
+        sub = sub.copy()
+        sub["_wd"] = sub["정산일시일"].dt.weekday
+        sale = sub[sub["정산구분"] == "판매"]
+        tot_by_wd = sale.groupby("_wd")["거래액_VAT제외"].sum().to_dict()
+        net_by_wd = sub.groupby("_wd")["거래액_VAT제외"].sum().to_dict()
+
+    rows = []
+    for wd in range(7):
+        cnt = weekday_counts.get(wd, 0)
+        tot = float(tot_by_wd.get(wd, 0))
+        net = float(net_by_wd.get(wd, 0))
+        rows.append({
+            "요일": WEEKDAY_LABELS[wd],
+            "avg_tot": (tot / cnt) if cnt else 0.0,
+            "avg_net": (net / cnt) if cnt else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
 def daily_uv_cert_table(uv_df, cert_df, dates, partners=None, exclude_af=None) -> pd.DataFrame:
     """partners=None 이면 전체 제휴사 기준."""
     dates_sorted = sorted(dates)
