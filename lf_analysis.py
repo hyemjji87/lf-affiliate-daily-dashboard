@@ -80,16 +80,26 @@ def classify_workbook(file_bytes: bytes) -> dict:
     if not amt.empty:
         amt["정산일시일"] = _to_date(amt["정산일시일"])
         amt["거래액_VAT제외"] = pd.to_numeric(amt["거래액_VAT제외"], errors="coerce").fillna(0)
-        amt["제휴사"] = amt["제휴사"].astype(str)
+        # 카드사 계열 제휴사(예: 농협카드)처럼 셀에 공백이 섞여 들어오면 "당월인증==Y" 매칭이나
+        # 제휴사명 그룹핑이 어긋날 수 있어, 앞뒤 공백을 제거하고 인증 플래그는 대소문자까지 통일한다.
+        amt["제휴사"] = amt["제휴사"].astype(str).str.strip()
         amt.loc[amt["제휴사"].isin(["nan", "None", ""]), "제휴사"] = np.nan
+        if "당월인증" in amt.columns:
+            amt["당월인증"] = amt["당월인증"].astype(str).str.strip().str.upper()
+        if "기존/win-back/신규" in amt.columns:
+            amt["기존/win-back/신규"] = amt["기존/win-back/신규"].astype(str).str.strip()
     if not uv.empty:
         uv["★일자일"] = _to_date(uv["★일자일"])
         uv["★UV"] = pd.to_numeric(uv["★UV"], errors="coerce").fillna(0)
+        if "제휴사명" in uv.columns:
+            uv["제휴사명"] = uv["제휴사명"].astype(str).str.strip()
     if not cert.empty:
         cert["인증일시일"] = _to_date(cert["인증일시일"])
         for c in ["총합계", "기존", "WIN-BACK", "신규"]:
             if c in cert.columns:
                 cert[c] = pd.to_numeric(cert[c], errors="coerce").fillna(0)
+        if "제휴사" in cert.columns:
+            cert["제휴사"] = cert["제휴사"].astype(str).str.strip()
 
     return {"amt": amt, "uv": uv, "cert": cert, "pivot": pivot_df}
 

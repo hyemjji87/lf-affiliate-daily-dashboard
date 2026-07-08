@@ -26,9 +26,9 @@ import lf_analysis as A
 
 st.set_page_config(page_title="LF몰 일반제휴 실적", page_icon="📊", layout="wide")
 
-# HTML 내보내기용: 화면에 그려지는 표/카드 HTML을 순서대로 모아뒀다가 사이드바의
-# "HTML로 내보내기" 버튼에서 하나의 정적 HTML 문서로 합친다.
-EXPORT_BLOCKS: list[str] = []
+# HTML 내보내기용: 화면에 그려지는 표/카드 HTML을 탭(섹션) 단위로 모아뒀다가
+# 사이드바의 "HTML로 내보내기" 버튼에서 탭 전환이 되는 하나의 정적 HTML 문서로 합친다.
+EXPORT_SECTIONS: list[dict] = []
 
 # 일자별 목표(순결제 기준) 파일 - 연말까지 고정값이라 업로드 대신 리포에 고정 파일로 관리한다.
 # 목표가 갱신되면 이 파일(target_data.xlsx)만 교체하면 된다 (별도 요청 시 반영).
@@ -69,7 +69,7 @@ def sub(title: str):
     섹션 제목으로 대체."""
     html = f"<div style='font-size:16px;font-weight:700;margin:18px 0 6px;'>{title}</div>"
     st.markdown(html, unsafe_allow_html=True)
-    EXPORT_BLOCKS.append(html)
+    _export_target().append(html)
 
 
 def pct_ratio(cur, prev):
@@ -104,12 +104,19 @@ COLOR_MAP = {"success": "#1a7f37", "danger": "#cf222e", "muted": "#6e7781", "acc
 def md(html: str):
     """unsafe_allow_html 표/카드 HTML을 화면에 출력하면서 동시에 HTML 내보내기용으로 모아둔다."""
     st.markdown(html, unsafe_allow_html=True)
-    EXPORT_BLOCKS.append(html)
+    _export_target().append(html)
 
 
-def export_only(html: str):
-    """화면에는 표시하지 않고 HTML 내보내기 문서에만 들어갈 구획(탭 제목 등)을 추가한다."""
-    EXPORT_BLOCKS.append(html)
+def export_tab(name: str):
+    """HTML 내보내기 문서에서 새 탭 섹션을 시작한다 (화면에는 아무것도 그리지 않음).
+    이후 sub()/md() 호출은 이 탭 섹션 안에 쌓인다."""
+    EXPORT_SECTIONS.append({"name": name, "html": []})
+
+
+def _export_target() -> list:
+    if not EXPORT_SECTIONS:
+        EXPORT_SECTIONS.append({"name": "개요", "html": []})
+    return EXPORT_SECTIONS[-1]["html"]
 
 
 def render_grouped_table(header_groups: list, rows: list, color_rows: list | None = None, first_col_label: str = "일자"):
@@ -189,12 +196,16 @@ def render_simple_table(columns: list, rows: list, color_rows: list | None = Non
 
 def render_kpi_cards(cards: list) -> str:
     """개요 탭 상단 KPI 카드(UV·인증자수·전체거래액·당월인증거래액)를 렌더링.
-    cards: [(label, value_str, yoy_str, yoy_color_key, target_str, target_color_key), ...]
+    cards: [(label, value_str, yoy_str, yoy_color_key, target_str_or_None, target_color_key), ...]
+    target_str가 None이면 목표비 자체를 표시하지 않는다(UV·인증자수는 목표 데이터가 없음).
     """
     cells = []
     for label, val, yoy, yoy_c, tgt, tgt_c in cards:
         yoy_css = f"color:{COLOR_MAP.get(yoy_c, '#24292f')};font-weight:600;"
-        tgt_css = f"color:{COLOR_MAP.get(tgt_c, '#24292f')};font-weight:600;"
+        tgt_html = ""
+        if tgt is not None:
+            tgt_css = f"color:{COLOR_MAP.get(tgt_c, '#24292f')};font-weight:600;"
+            tgt_html = f'&nbsp;·&nbsp;<span style="{tgt_css}">목표비 {tgt}</span>'
         cells.append(
             '<div style="flex:1;min-width:180px;border:1px solid #e1e4e8;border-radius:8px;'
             'padding:14px 16px;background:#fff;">'
@@ -202,8 +213,7 @@ def render_kpi_cards(cards: list) -> str:
             f'<div style="font-size:22px;font-weight:700;">{val}</div>'
             '<div style="font-size:12px;margin-top:6px;white-space:nowrap;">'
             f'<span style="{yoy_css}">전년비 {yoy}</span>'
-            "&nbsp;·&nbsp;"
-            f'<span style="{tgt_css}">목표비 {tgt}</span>'
+            f'{tgt_html}'
             "</div></div>"
         )
     return f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 20px;">{"".join(cells)}</div>'
@@ -322,7 +332,7 @@ tab_ov, tab_daily, tab_partner, tab_cat, tab_brand = st.tabs(
 # 개요 탭
 # ====================================================================================
 with tab_ov:
-    export_only('<h2 style="font-size:20px;font-weight:700;margin:0 0 12px;">개요</h2>')
+    export_tab("개요")
 
     uv_cur = A.uv_total(cur_data["uv"], sel_dates, None, exclude_af=exclude_af)
     uv_prev = A.uv_total(ly_cert_data["uv"], ly_all_dates, None) if not ly_cert_data["uv"].empty else None
@@ -340,16 +350,20 @@ with tab_ov:
     kpi_cert_net_tgt = A.target_sum(target_df, sel_dates, "cert", "total")
 
     sub("핵심 지표 (KPI)")
+    # UV·인증자수는 목표 데이터가 없어 목표비 자체를 표시하지 않는다.
     kpi_defs = [
-        ("UV", uv_cur, uv_prev, None),
-        ("인증자수", cert_cur["전체"], cert_prev["전체"], None),
-        ("전체거래액 (순결제)", kpi_all_net_cur, kpi_all_net_prev, kpi_all_net_tgt),
-        ("당월인증거래액 (순결제)", kpi_cert_net_cur, kpi_cert_net_prev, kpi_cert_net_tgt),
+        ("UV", uv_cur, uv_prev, None, False),
+        ("인증자수", cert_cur["전체"], cert_prev["전체"], None, False),
+        ("전체거래액 (순결제)", kpi_all_net_cur, kpi_all_net_prev, kpi_all_net_tgt, True),
+        ("당월인증거래액 (순결제)", kpi_cert_net_cur, kpi_cert_net_prev, kpi_cert_net_tgt, True),
     ]
     kpi_cards = []
-    for label, cur_v, prev_v, tgt_v in kpi_defs:
+    for label, cur_v, prev_v, tgt_v, show_target in kpi_defs:
         d_disp, d_color, _ = pct_ratio(cur_v, prev_v)
-        t_disp, t_color, _ = target_ratio(cur_v, tgt_v)
+        if show_target:
+            t_disp, t_color, _ = target_ratio(cur_v, tgt_v)
+        else:
+            t_disp, t_color = None, None
         kpi_cards.append((label, fmt(cur_v), d_disp, d_color, t_disp, t_color))
     md(render_kpi_cards(kpi_cards))
 
@@ -444,8 +458,7 @@ with tab_ov:
 # 일자별 탭 (화면 = 값 + 전년비만, 전년 원본값은 엑셀에만)
 # ====================================================================================
 with tab_daily:
-    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
-                'border-top:2px solid #d0d7de;padding-top:20px;">일자별</h2>')
+    export_tab("일자별")
     daily_uc = A.daily_uv_cert_table(cur_data["uv"], cur_data["cert"], sel_dates, None, exclude_af=exclude_af)
     daily_uc_ly = (A.daily_uv_cert_table(ly_cert_data["uv"], ly_cert_data["cert"], ly_all_dates, None)
                    if (not ly_cert_data["uv"].empty or not ly_cert_data["cert"].empty) else None)
@@ -460,8 +473,8 @@ with tab_daily:
     uv_total_cur = daily_uc["UV"].sum()
     uv_total_prev = daily_uc_ly["UV"].sum() if daily_uc_ly is not None else None
     uv_t_disp, uv_t_color, _ = pct_ratio(uv_total_cur, uv_total_prev)
-    uv_rows.append(["<b>합계</b>", f"<b>{fmt(uv_total_cur)}</b>", f"<b>{uv_t_disp}</b>"])
-    uv_color_rows.append([None, uv_t_color])
+    uv_rows.insert(0, ["<b>합계</b>", f"<b>{fmt(uv_total_cur)}</b>", f"<b>{uv_t_disp}</b>"])
+    uv_color_rows.insert(0, [None, uv_t_color])
     md(render_simple_table(["일자", "UV", "전년비"], uv_rows, uv_color_rows))
 
     sub("인증자수 (전체·신규·윈백·기존)")
@@ -486,8 +499,8 @@ with tab_daily:
         d_disp, d_color, _ = pct_ratio(cur_sum, prev_sum)
         cert_total_row += [f"<b>{fmt(cur_sum)}</b>", f"<b>{d_disp}</b>"]
         cert_total_color_row += [None, d_color]
-    cert_rows.append(cert_total_row)
-    cert_color_rows.append(cert_total_color_row)
+    cert_rows.insert(0, cert_total_row)
+    cert_color_rows.insert(0, cert_total_color_row)
     cert_groups = [(s, ["인증수", "전년비"]) for s in ["전체", "신규", "윈백", "기존"]]
     md(render_grouped_table(cert_groups, cert_rows, cert_color_rows))
 
@@ -534,8 +547,8 @@ with tab_daily:
                 t_disp, t_color, _ = target_ratio(cur_sum, tgt_v)
                 total_row.append(f"<b>{t_disp}</b>")
                 total_color_row.append(t_color)
-        rows.append(total_row)
-        color_rows.append(total_color_row)
+        rows.insert(0, total_row)
+        color_rows.insert(0, total_color_row)
         subcols = ["실적", "전년비"] + (["목표비"] if show_target else [])
         groups = [(s, subcols) for s in ["전체", "신규", "윈백", "기존"]]
         md(render_grouped_table(groups, rows, color_rows))
@@ -566,9 +579,9 @@ with tab_daily:
         aov_total_prev = (amt_total_prev / cust_total_prev) if (ly_d is not None and cust_total_prev) else None
         td1, tc1, _ = pct_ratio(cust_total_cur, cust_total_prev)
         td2, tc2, _ = pct_ratio(aov_total_cur, aov_total_prev)
-        rows.append(["<b>합계</b>", f"<b>{fmt(cust_total_cur)}</b>", f"<b>{td1}</b>",
-                     f"<b>{fmt(aov_total_cur)}</b>", f"<b>{td2}</b>"])
-        color_rows.append([None, tc1, None, tc2])
+        rows.insert(0, ["<b>합계</b>", f"<b>{fmt(cust_total_cur)}</b>", f"<b>{td1}</b>",
+                        f"<b>{fmt(aov_total_cur)}</b>", f"<b>{td2}</b>"])
+        color_rows.insert(0, [None, tc1, None, tc2])
         groups = [("고객수", ["실적", "전년비"]), ("객단가", ["실적", "전년비"])]
         md(render_grouped_table(groups, rows, color_rows, first_col_label="일자"))
 
@@ -579,8 +592,7 @@ with tab_daily:
 # 제휴사별 실적 탭
 # ====================================================================================
 with tab_partner:
-    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
-                'border-top:2px solid #d0d7de;padding-top:20px;">제휴사별 실적</h2>')
+    export_tab("제휴사별 실적")
     paytype_p = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="partner_paytype")
     ptp = "net" if paytype_p == "순결제" else "tot"
 
@@ -643,8 +655,7 @@ with tab_partner:
 # 카테고리별 실적 탭
 # ====================================================================================
 with tab_cat:
-    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
-                'border-top:2px solid #d0d7de;padding-top:20px;">카테고리별 실적</h2>')
+    export_tab("카테고리별 실적")
     paytype_c = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="cat_paytype")
     ptc = "net" if paytype_c == "순결제" else "tot"
 
@@ -677,8 +688,7 @@ with tab_cat:
 # 브랜드별 실적 탭
 # ====================================================================================
 with tab_brand:
-    export_only('<h2 style="font-size:20px;font-weight:700;margin:32px 0 12px;'
-                'border-top:2px solid #d0d7de;padding-top:20px;">브랜드별 실적</h2>')
+    export_tab("브랜드별 실적")
     paytype_b = st.radio("결제 구분", ["순결제", "총결제"], horizontal=True, key="brand_paytype")
     ptb = "net" if paytype_b == "순결제" else "tot"
 
@@ -713,20 +723,37 @@ with tab_brand:
 st.sidebar.divider()
 st.sidebar.header("⤓ Step 3. 내보내기")
 
-if st.sidebar.button("HTML로 내보내기"):
-    export_html = (
-        "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
-        f"<title>LF몰 일반제휴 실적 - {period_txt}</title>"
-        "<style>body{font-family:-apple-system,'Malgun Gothic',sans-serif;"
-        "max-width:1100px;margin:24px auto;padding:0 16px;color:#1f2328;background:#fff;}"
-        "</style></head><body>"
-        "<h1 style='font-size:24px;margin-bottom:4px;'>📊 LF몰 일반제휴 실적</h1>"
-        f"<p style='color:#57606a;margin-top:0;'>분석기간 {period_txt} · 전년 매칭: {yoy_mode_label}</p>"
-        + "".join(EXPORT_BLOCKS)
-        + "</body></html>"
-    )
-    st.sidebar.download_button("HTML 다운로드", export_html,
-                                file_name="lf_affiliate_report.html", mime="text/html")
+_tab_btns, _tab_panels = [], []
+for i, sec in enumerate(EXPORT_SECTIONS):
+    _tab_btns.append(f'<button class="lf-tabbtn{" active" if i == 0 else ""}" '
+                      f'onclick="lfShowTab({i})">{sec["name"]}</button>')
+    _tab_panels.append(f'<div class="lf-tabpanel" id="lf-tabpanel-{i}" '
+                        f'style="display:{"block" if i == 0 else "none"};">'
+                        f'{"".join(sec["html"])}</div>')
+
+export_html = (
+    "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+    f"<title>LF몰 일반제휴 실적 - {period_txt}</title>"
+    "<style>"
+    "body{font-family:-apple-system,'Malgun Gothic',sans-serif;max-width:1200px;margin:24px auto;"
+    "padding:0 16px;color:#1f2328;background:#fff;}"
+    ".lf-tabbar{display:flex;gap:4px;border-bottom:2px solid #d0d7de;margin:16px 0 20px;flex-wrap:wrap;}"
+    ".lf-tabbtn{border:none;background:none;padding:10px 16px;font-size:14px;font-weight:600;"
+    "color:#57606a;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;}"
+    ".lf-tabbtn.active{color:#0969da;border-bottom-color:#0969da;}"
+    "</style></head><body>"
+    "<h1 style='font-size:24px;margin-bottom:4px;'>📊 LF몰 일반제휴 실적</h1>"
+    f"<p style='color:#57606a;margin-top:0;'>분석기간 {period_txt} · 전년 매칭: {yoy_mode_label}</p>"
+    f'<div class="lf-tabbar">{"".join(_tab_btns)}</div>'
+    + "".join(_tab_panels)
+    + "<script>function lfShowTab(i){"
+      "document.querySelectorAll('.lf-tabpanel').forEach(function(el,idx){el.style.display = idx===i ? 'block' : 'none';});"
+      "document.querySelectorAll('.lf-tabbtn').forEach(function(el,idx){el.classList.toggle('active', idx===i);});"
+      "}</script>"
+    "</body></html>"
+)
+st.sidebar.download_button("⤓ HTML로 내보내기", export_html,
+                            file_name="lf_affiliate_report.html", mime="text/html")
 
 if st.sidebar.button("현재 화면 JSON 스냅샷 만들기"):
     snapshot = {
