@@ -332,57 +332,137 @@ def pareto_summary(amt_cur, dates_cur, groupcol="Admin브랜드명", pt="net", c
 # 6) 목표 / LF몰 전체거래액 로더 (월별 wide 템플릿)
 # ======================================================================================
 def _norm_ym(v) -> str | None:
+    """월 헤더 문자열을 'YYYY-MM'으로 정규화. 연 2000~2099·월 1~12만 인정
+    (숫자 값 '2633.0' 등을 연-월로 오인하지 않도록 범위 검증)."""
     if isinstance(v, (dt.date, dt.datetime)):
         return f"{v.year}-{v.month:02d}"
     s = str(v).strip()
-    digits = re.sub(r"[^0-9]", "", s)
-    if len(digits) >= 6:
-        return f"{digits[:4]}-{int(digits[4:6]):02d}"
-    m = re.match(r"^(\d{4})[-./](\d{1,2})", s)
+    y = mth = None
+    m = re.match(r"^(20\d{2})[-./](\d{1,2})(?!\d)", s)  # 2026-01 / 2026.1
     if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}"
+        y, mth = int(m.group(1)), int(m.group(2))
+    else:
+        digits = re.sub(r"[^0-9]", "", s)
+        if len(digits) == 6:  # 202601 (정확히 6자리)
+            y, mth = int(digits[:4]), int(digits[4:6])
+    if y is not None and 2000 <= y <= 2099 and 1 <= mth <= 12:
+        return f"{y}-{mth:02d}"
     return None
 
 
+METRIC_KEYS = ["UV", "인증자수", "당월인증거래액", "거래액"]
+
+
+def _canon_metric(s):
+    s = str(s)
+    if "당월인증" in s:
+        return "당월인증거래액"
+    if "UV" in s.upper():
+        return "UV"
+    if "인증" in s:  # 인증자수 / 인증회원수 등
+        return "인증자수"
+    if "거래액" in s or "매출" in s:
+        return "거래액"
+    return None
+
+
+def _canon_seg(s):
+    s = str(s).strip().lower()
+    if s in ("신규", "new"):
+        return "신규"
+    if "win" in s or "윈백" in s:
+        return "윈백"
+    if s in ("기존", "existing"):
+        return "기존"
+    if s in ("전체", "합계", "계", "total"):
+        return "전체"
+    return None
+
+
+def _find_month_header(data):
+    """월(YYYY-MM) 헤더가 있는 행 index와 {열idx: ym} 매핑을 찾는다(제목행이 위에 있어도 대응)."""
+    best_i, best_map = None, {}
+    for i, row in enumerate(data[:20]):
+        m = {}
+        for j, c in enumerate(row or []):
+            ym = _norm_ym(c)
+            if ym:
+                m[j] = ym
+        if len(m) > len(best_map):
+            best_i, best_map = i, m
+    return best_i, best_map
+
+
 def load_target(file_bytes: bytes) -> pd.DataFrame:
-    """목표 파일 로더. 기대 구조: 열 [지표, 세그, <월들...>].
-    지표 ∈ {UV, 인증자수, 당월인증거래액, 거래액}, 세그 ∈ {전체, 신규, 윈백, 기존}.
-    반환(long): 지표, 세그, ym, 목표값. '전체'가 없으면 세그 합으로 생성."""
+    """목표 파일 로더 — 두 가지 레이아웃을 모두 인식한다.
+    (A) 구조형: 열 [지표, 세그, <월들…>]
+    (B) 섹션형(사용자 양식): 월=열, 지표명 헤더행 아래 신규/윈백/기존 행이 이어짐.
+    지표 ∈ {UV, 인증자수, 당월인증거래액, 거래액}. 반환(long): 지표, 세그, ym, 목표.
+    '전체'가 없으면 세그 합으로 자동 생성."""
     sheets = A._read_all_sheets(file_bytes)
-    data = None
-    for sn, d in sheets.items():
-        if d and any("지표" in str(c) for c in (d[0] or [])):
-            data = d
-            break
-    if data is None:
-        data = next(iter(sheets.values()), None)
-    if not data:
-        return pd.DataFrame(columns=["지표", "세그", "ym", "목표"])
-    header = [str(c).strip() for c in data[0]]
-    # 월 컬럼 위치
-    ym_cols = {j: _norm_ym(header[j]) for j in range(len(header)) if _norm_ym(header[j])}
-    try:
-        i_metric = next(j for j, c in enumerate(header) if "지표" in c)
-    except StopIteration:
-        i_metric = 0
-    i_seg = next((j for j, c in enumerate(header) if "세그" in c or "구분" in c), 1)
-    rows = []
-    for r in data[1:]:
-        if not r or i_metric >= len(r) or r[i_metric] in (None, ""):
+    best = None
+    for d in sheets.values():
+        if not d:
             continue
-        metric = str(r[i_metric]).strip()
-        seg = str(r[i_seg]).strip() if i_seg < len(r) and r[i_seg] not in (None, "") else "전체"
-        seg = {"win-back": "윈백", "WIN-BACK": "윈백"}.get(seg, seg)
-        for j, ym in ym_cols.items():
-            if j < len(r) and r[j] not in (None, ""):
-                try:
-                    rows.append({"지표": metric, "세그": seg, "ym": ym, "목표": float(r[j])})
-                except (TypeError, ValueError):
-                    pass
+        hi, mm = _find_month_header(d)
+        if hi is not None and len(mm) >= 3 and (best is None or len(mm) > len(best[2])):
+            best = (d, hi, mm)
+    if best is None:
+        return pd.DataFrame(columns=["지표", "세그", "ym", "목표"])
+    data, hi, ym_cols = best
+    header = [str(c).strip() for c in data[hi]]
+    i_metric = next((j for j, c in enumerate(header) if "지표" in c), None)
+    i_seg = next((j for j, c in enumerate(header) if "세그" in c or "구분" in c), None)
+
+    rows = []
+
+    def _add(metric, seg, ym, v):
+        if metric is None or seg is None or v in (None, ""):
+            return
+        try:
+            rows.append({"지표": metric, "세그": seg, "ym": ym, "목표": float(v)})
+        except (TypeError, ValueError):
+            pass
+
+    if i_metric is not None:  # (A) 구조형
+        if i_seg is None:
+            i_seg = i_metric + 1
+        for r in data[hi + 1:]:
+            if not r or i_metric >= len(r) or r[i_metric] in (None, ""):
+                continue
+            metric = _canon_metric(r[i_metric])
+            seg = _canon_seg(r[i_seg]) if (i_seg < len(r) and r[i_seg] not in (None, "")) else "전체"
+            for j, ym in ym_cols.items():
+                if j < len(r):
+                    _add(metric, seg or "전체", ym, r[j])
+    else:  # (B) 섹션형
+        label_cols = [j for j in range(len(header)) if j not in ym_cols]
+        lc = label_cols[0] if label_cols else 0
+        current = None
+        for r in data[hi + 1:]:
+            if not r:
+                continue
+            label = str(r[lc]).strip() if (lc < len(r) and r[lc] not in (None, "")) else ""
+            if not label:
+                continue
+            seg = _canon_seg(label)
+            if seg:  # 세그 행
+                for j, ym in ym_cols.items():
+                    if j < len(r):
+                        _add(current, seg, ym, r[j])
+            else:
+                m = _canon_metric(label)
+                if m:
+                    current = m
+                    # 지표 헤더행이 값을 직접 담고 있으면(UV처럼 세그 없는 지표) 전체로 적재
+                    if any(j < len(r) and r[j] not in (None, "") for j in ym_cols):
+                        for j, ym in ym_cols.items():
+                            if j < len(r):
+                                _add(m, "전체", ym, r[j])
+
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # 전체 보강
     out = [df]
     for (metric, ym), g in df.groupby(["지표", "ym"]):
         if "전체" not in set(g["세그"]):
@@ -403,15 +483,24 @@ def load_lfmall(file_bytes: bytes) -> pd.DataFrame:
     """LF몰 전체거래액 로더. 기대 구조: 열 [구분, <월들...>], 구분 ∈ {목표, 실제}.
     (또는 열 [월, 목표, 실제]). 반환: ym, 목표, 실제."""
     sheets = A._read_all_sheets(file_bytes)
-    data = next(iter(sheets.values()), None)
+    # 월 헤더가 가장 많은 시트/행을 선택(제목행이 있어도 대응)
+    best = None
+    for d in sheets.values():
+        if not d:
+            continue
+        hi, mm = _find_month_header(d)
+        if hi is not None and len(mm) >= 3 and (best is None or len(mm) > len(best[2])):
+            best = (d, hi, mm)
+    data = best[0] if best else next(iter(sheets.values()), None)
     if not data:
         return pd.DataFrame(columns=["ym", "목표", "실제"])
-    header = [str(c).strip() for c in data[0]]
-    ym_cols = {j: _norm_ym(header[j]) for j in range(len(header)) if _norm_ym(header[j])}
+    hi = best[1] if best else 0
+    header = [str(c).strip() for c in data[hi]]
+    ym_cols = best[2] if best else {}
     result = {}
     if ym_cols:  # 가로형: 구분 x 월
         i_kind = next((j for j, c in enumerate(header) if "구분" in c or "목표" in c or "실제" in c), 0)
-        for r in data[1:]:
+        for r in data[hi + 1:]:
             if not r or i_kind >= len(r) or r[i_kind] in (None, ""):
                 continue
             kind = "목표" if "목표" in str(r[i_kind]) else ("실제" if ("실제" in str(r[i_kind]) or "실적" in str(r[i_kind])) else None)
@@ -449,3 +538,59 @@ def lfmall_value(lf_df, ym, kind="실제"):
         return None
     v = sub[kind].iloc[0]
     return None if pd.isna(v) else float(v)
+
+
+# ======================================================================================
+# 7) 업로드 양식(빈 템플릿) 생성 - 앱에서 다운로드 제공
+# ======================================================================================
+def build_target_template(year: int = 2026) -> bytes:
+    """목표 업로드 양식 xlsx bytes. load_target()가 읽는 구조와 정확히 일치."""
+    import io
+    import openpyxl
+    months = [f"{year}-{m:02d}" for m in range(1, 13)]
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "목표"
+    ws.append(["구분"] + months + ["TOTAL"])          # TOTAL 열은 읽을 때 무시됨
+    ws.append([f"UV 목표 {year}"] + [0] * 12 + [None])   # UV: 지표 헤더행에 값 직접 입력
+    for metric in ("인증자수", "당월인증거래액", "거래액"):
+        ws.append([f"{metric} 목표 {year}"] + [None] * 12 + [None])  # 지표 헤더행
+        for seg in ("신규", "win-back", "기존"):
+            ws.append([f"  {seg}"] + [0] * 12 + [None])
+    guide = wb.create_sheet("작성안내")
+    for line in [
+        "[목표 업로드 양식]",
+        "· 월 열(2026-01 …)에 목표값을 입력하세요. TOTAL 열은 참고용(자동 무시).",
+        "· 지표: UV / 인증자수 / 당월인증거래액 / 거래액",
+        "· 각 지표 아래 신규 / win-back / 기존 행에 입력. UV는 헤더행에 바로 입력.",
+        "· 거래액·당월인증거래액은 VAT 제외·원 단위.",
+        "· 전체는 신규+윈백+기존 합으로 자동 계산됩니다.",
+        "· 월 헤더는 2026-01 / 202601 / 2026.1 모두 인식합니다.",
+    ]:
+        guide.append([line])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_lfmall_template(year: int = 2026) -> bytes:
+    """LF몰 전체거래액 업로드 양식 xlsx bytes. load_lfmall()가 읽는 구조와 일치."""
+    import io
+    import openpyxl
+    months = [f"{year}-{m:02d}" for m in range(1, 13)]
+    wb = openpyxl.Workbook()
+    w = wb.active
+    w.title = "LF몰전체거래액"
+    w.append(["구분"] + months)
+    w.append(["목표"] + [0] * 12)
+    w.append(["실제"] + [0] * 12)
+    guide = wb.create_sheet("작성안내")
+    for line in [
+        "[LF몰 전체거래액 업로드 양식]",
+        "· 월별 LF몰 전체 거래액(VAT 제외·원)을 입력하세요.",
+        "· '목표'/'실제' 2개 행. 비중 계산은 '실제' 기준입니다.",
+    ]:
+        guide.append([line])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
