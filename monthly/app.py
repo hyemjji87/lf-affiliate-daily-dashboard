@@ -284,7 +284,7 @@ def cr(bundle):
 
 # 지표 정의: (라벨, getter(bundle)->값, 목표지표명 or None, 포맷단위)
 METRICS = [
-    ("UV", lambda b: b["uv"], "UV", 1),
+    ("UV", lambda b: b["uv"], None, 1),   # UV는 목표비 미표시(전년비만)
     ("인증자수", lambda b: b["cert"]["전체"], "인증자수", 1),
     ("당월인증고객수", lambda b: b["amt_cert"]["전체"][f"cust_{pt}"], None, 1),
     ("당월인증CR", lambda b: cr(b) * 100, None, 1),   # % 표시
@@ -316,7 +316,7 @@ with tabs[0]:
 
     sub("핵심 지표 (KPI)", f"{primary} · {paytype}")
     cards = [
-        _kpi("UV", bp["uv"], bpp["uv"], "UV"),
+        _kpi("UV", bp["uv"], bpp["uv"], None),
         _kpi("인증자수", bp["cert"]["전체"], bpp["cert"]["전체"], "인증자수"),
         _kpi("당월인증거래액 (백만)", bp["amt_cert"]["전체"][pt], bpp["amt_cert"]["전체"][pt], "당월인증거래액", unit=1_000_000),
         _kpi("전체거래액 (백만)", bp["amt_all"]["전체"][pt], bpp["amt_all"]["전체"][pt], "거래액", unit=1_000_000),
