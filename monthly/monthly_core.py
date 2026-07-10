@@ -176,6 +176,40 @@ def _prune(df, keep):
         df.drop(columns=drop, inplace=True)
 
 
+def load_raw_pruned(list_of_bytes: list) -> dict:
+    """raw 파일들을 '한 개씩' 로드→파생/프루닝→누적→마지막에 concat 한다.
+    여러 달 raw를 한꺼번에 메모리에 올리지 않아 최대 메모리를 크게 낮춘다
+    (Streamlit Cloud OOM 방지). 반환: {amt, uv, cert, pivot}. amt/uv/cert는 이미 enrich·프루닝됨."""
+    import gc
+    empty = {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame(), "pivot": None}
+    if not list_of_bytes:
+        return empty
+    pivot = None
+    maps = None
+    amts, uvs, certs = [], [], []
+    for b in list_of_bytes:
+        d = A.classify_workbook(b)          # 파일 1개(전체 컬럼)
+        if maps is None and d.get("pivot") is not None:
+            pivot = d["pivot"]
+            maps = parse_pivot(pivot)
+        enrich(d, maps or {})               # 파생값 계산 후 불필요 컬럼 프루닝
+        for key, acc in (("amt", amts), ("uv", uvs), ("cert", certs)):
+            f = d.get(key)
+            if f is not None and not f.empty:
+                acc.append(f)
+        del d
+        gc.collect()
+    out = {
+        "amt": pd.concat(amts, ignore_index=True) if amts else pd.DataFrame(),
+        "uv": pd.concat(uvs, ignore_index=True) if uvs else pd.DataFrame(),
+        "cert": pd.concat(certs, ignore_index=True) if certs else pd.DataFrame(),
+        "pivot": pivot,
+    }
+    del amts, uvs, certs
+    gc.collect()
+    return out
+
+
 def _ym_str(ym):
     return f"{ym[0]}-{ym[1]:02d}" if ym else None
 

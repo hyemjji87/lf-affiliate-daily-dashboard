@@ -37,10 +37,8 @@ def _sig(files) -> tuple:
 
 @st.cache_data(show_spinner=False)
 def _load_raw(list_of_bytes: tuple) -> dict:
-    if not list_of_bytes:
-        return {"amt": pd.DataFrame(), "uv": pd.DataFrame(), "cert": pd.DataFrame(), "pivot": None}
-    merged = A.merge_workbooks(list(list_of_bytes))
-    return merged
+    # 파일 1개씩 로드→파생→컬럼 프루닝→누적(메모리 절감). 결과는 이미 enrich·프루닝됨.
+    return M.load_raw_pruned(list(list_of_bytes))
 
 
 @st.cache_data(show_spinner=False)
@@ -195,16 +193,13 @@ if not cur_bytes:
     st.info("왼쪽에서 **① 당년 raw** 파일을 업로드하면 분석이 시작됩니다.")
     st.stop()
 
-cur_data = _load_raw(cur_bytes)
+cur_data = _load_raw(cur_bytes)          # 이미 enrich·프루닝됨
 maps = M.parse_pivot(cur_data.get("pivot"))
-M.enrich(cur_data, maps)
 
 ly_i_bytes, _ = _read_files(up_ly_inflow)
 ly_a_bytes, _ = _read_files(up_ly_amt)
-ly_inflow = _load_raw(ly_i_bytes)
+ly_inflow = _load_raw(ly_i_bytes)        # 이미 enrich·프루닝됨
 ly_amt = _load_raw(ly_a_bytes)
-M.enrich(ly_inflow, maps)
-M.enrich(ly_amt, maps)
 prev_data = {"amt": ly_amt.get("amt", pd.DataFrame()),
              "uv": ly_inflow.get("uv", pd.DataFrame()),
              "cert": ly_inflow.get("cert", pd.DataFrame())}
