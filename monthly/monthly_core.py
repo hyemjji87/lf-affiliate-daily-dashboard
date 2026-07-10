@@ -156,7 +156,24 @@ def enrich(data: dict, maps: dict) -> dict:
         uv["_마감"] = dser.map(lambda d: _ym_str(d2close.get(d)) or _cal_ym(d))
         uv["_주차"] = dser.map(lambda d: d2label.get(d) or "")
 
+    # 메모리 절감: 집계에 쓰지 않는 무거운 컬럼(상품명 등)을 제거한다.
+    # (Streamlit Cloud 메모리 한도 대비 — raw 여러 달 업로드 시 수십만 행 × 긴 문자열)
+    _prune(amt, ["정산일시일", "거래액_VAT제외", "정산구분", "고객번호", "기존/win-back/신규",
+                 "당월인증", "제휴사", "BPU", "물리대카테", "Admin브랜드명",
+                 "회원등급", "첫구매주문건여부", "정상이월구분", "상품코드",  # 향후 분석용 보존
+                 "_마감", "_주차", "_주차N"])
+    _prune(uv, ["★일자일", "★UV", "AF코드", "제휴사명", "_마감", "_주차"])
+    _prune(cert, ["인증일시일", "총합계", "기존", "WIN-BACK", "신규", "제휴사", "_마감", "_주차"])
     return data
+
+
+def _prune(df, keep):
+    """DataFrame에서 keep 목록에 있는 컬럼만 남긴다(존재하는 것만). in-place."""
+    if df is None or df.empty:
+        return
+    drop = [c for c in df.columns if c not in keep]
+    if drop:
+        df.drop(columns=drop, inplace=True)
 
 
 def _ym_str(ym):
