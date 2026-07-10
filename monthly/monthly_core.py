@@ -137,7 +137,9 @@ def enrich(data: dict, maps: dict) -> dict:
         amt["_주차N"] = dser.map(lambda d: d2week.get(d) or 0)
 
     if cert is not None and not cert.empty:
-        code_col = "제휴처구분4" if "제휴처구분4" in cert.columns else "제휴처구분3"
+        # amt는 제휴처구분3으로 제휴사명을 매핑하므로, 조인 일치를 위해 cert도 제휴처구분3 우선 사용
+        # (삼성카드처럼 구분3·4가 달라 인증자수가 0으로 어긋나는 문제 방지)
+        code_col = "제휴처구분3" if "제휴처구분3" in cert.columns else "제휴처구분4"
         if code_col in cert.columns:
             need_p = "제휴사" not in cert.columns or cert["제휴사"].isna().all()
             if need_p:
@@ -205,9 +207,25 @@ def load_raw_pruned(list_of_bytes: list) -> dict:
         "cert": pd.concat(certs, ignore_index=True) if certs else pd.DataFrame(),
         "pivot": pivot,
     }
+    _optimize_dtypes(out["amt"])  # 저카디널리티 문자열 → category (12개월 대비 메모리 절감)
     del amts, uvs, certs
     gc.collect()
     return out
+
+
+def _optimize_dtypes(amt):
+    """반복되는 저카디널리티 문자열 컬럼을 category로 바꿔 메모리를 크게 줄인다.
+    groupby/==/isin 에만 쓰이는 컬럼이라 집계 결과에는 영향 없음."""
+    if amt is None or amt.empty:
+        return
+    for c in ["정산구분", "기존/win-back/신규", "당월인증", "제휴사", "BPU", "물리대카테",
+              "Admin브랜드명", "회원등급", "첫구매주문건여부", "정상이월구분", "상품코드",
+              "_마감", "_주차"]:
+        if c in amt.columns:
+            try:
+                amt[c] = amt[c].astype("category")
+            except (TypeError, ValueError):
+                pass
 
 
 def _ym_str(ym):
@@ -230,9 +248,11 @@ def available_months(*datasets) -> list:
     return sorted(m for m in ms if m)
 
 
-def month_dates(data: dict, ym: str, maps: dict, mtd_day: int | None = None) -> list:
+def month_dates(data: dict, ym: str, maps: dict, mtd_day: int | None = None,
+                max_date=None) -> list:
     """해당 마감월(ym)에 속하는 실제 날짜 목록. 피벗 date_to_close 우선, 없으면 데이터에서 수집.
-    mtd_day가 주어지면 캘린더 일자 <= mtd_day 만."""
+    - mtd_day: 캘린더 일자 <= mtd_day 만 (MTD 모드)
+    - max_date: 이 날짜(포함) 이하만 (미마감 당월을 실제 데이터 마지막 일자까지 = MTD로 처리)"""
     dates = set()
     for d, close in maps.get("date_to_close", {}).items():
         if _ym_str(close) == ym:
@@ -245,7 +265,25 @@ def month_dates(data: dict, ym: str, maps: dict, mtd_day: int | None = None) -> 
     out = sorted(d for d in dates if d)
     if mtd_day is not None:
         out = [d for d in out if d.day <= mtd_day]
+    if max_date is not None:
+        out = [d for d in out if d <= max_date]
     return out
+
+
+_CAT_COLS = ["정산구분", "기존/win-back/신규", "당월인증", "제휴사", "BPU", "물리대카테",
+             "Admin브랜드명", "회원등급", "첫구매주문건여부", "정상이월구분", "상품코드", "_마감", "_주차"]
+
+
+def _to_category(df):
+    """반복 많은 저카디널리티 컬럼을 category로 변환(12개월 메모리 절감). groupby는 observed=True."""
+    if df is None or df.empty:
+        return
+    for c in _CAT_COLS:
+        if c in df.columns:
+            try:
+                df[c] = df[c].astype("category")
+            except (TypeError, ValueError):
+                pass
 
 
 def weeks_of_month(data: dict, ym: str) -> list:
@@ -322,8 +360,8 @@ def bpu_decomposition(amt_cur, dates_cur, amt_prev, dates_prev, pt="net", cert_o
         if sub.empty:
             return pd.DataFrame(columns=["BPU", "rev", "cust"])
         base = sub[sub["정산구분"] == "판매"] if pt == "tot" else sub
-        rev = base.groupby("BPU")["거래액_VAT제외"].sum()
-        cust = base.groupby("BPU")["고객번호"].nunique()
+        rev = base.groupby("BPU", observed=True)["거래액_VAT제외"].sum()
+        cust = base.groupby("BPU", observed=True)["고객번호"].nunique()
         return pd.DataFrame({"rev": rev, "cust": cust}).reset_index()
 
     cur = _agg(amt_cur, dates_cur).rename(columns={"rev": "rev_c", "cust": "cust_c"})
@@ -357,8 +395,8 @@ def new_penetration_table(amt_cur, dates_cur, groupcol="BPU", pt="net", cert_onl
     if sub.empty:
         return pd.DataFrame(columns=[groupcol, "전체", "신규", "침투율"])
     base = sub[sub["정산구분"] == "판매"] if pt == "tot" else sub
-    total = base.groupby(groupcol)["거래액_VAT제외"].sum()
-    new = base[base["기존/win-back/신규"] == "신규"].groupby(groupcol)["거래액_VAT제외"].sum()
+    total = base.groupby(groupcol, observed=True)["거래액_VAT제외"].sum()
+    new = base[base["기존/win-back/신규"] == "신규"].groupby(groupcol, observed=True)["거래액_VAT제외"].sum()
     out = pd.DataFrame({"전체": total, "신규": new}).fillna(0.0).reset_index()
     out["침투율"] = np.where(out["전체"] != 0, out["신규"] / out["전체"], 0)
     return out.sort_values("전체", ascending=False).reset_index(drop=True)
@@ -382,6 +420,50 @@ def pareto_summary(amt_cur, dates_cur, groupcol="Admin브랜드명", pt="net", c
 # ======================================================================================
 # 6) 목표 / LF몰 전체거래액 로더 (월별 wide 템플릿)
 # ======================================================================================
+def svg_line_chart(x_labels, series, title="", value_suffix="%", width=680, height=280) -> str:
+    """간단한 꺾은선 SVG (인앱 + HTML 내보내기 공용). value_suffix로 % 표기.
+    series: [(범례라벨, [값 or None ...], 색상)] — 값은 x_labels와 같은 길이."""
+    pad_l, pad_r, pad_t, pad_b = 52, 16, 34, 34
+    iw, ih = width - pad_l - pad_r, height - pad_t - pad_b
+    allv = [v for _, vals, _ in series for v in vals if v is not None]
+    ymax = max(allv) if allv else 1.0
+    ymax = ymax * 1.15 or 1.0
+    n = max(len(x_labels), 1)
+    def X(i):
+        return pad_l + (iw * i / (n - 1) if n > 1 else iw / 2)
+    def Y(v):
+        return pad_t + ih * (1 - v / ymax)
+    parts = [f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+             f'style="width:100%;max-width:{width}px;height:auto;font-family:-apple-system,\'Malgun Gothic\',sans-serif;">']
+    if title:
+        parts.append(f'<text x="{pad_l}" y="18" font-size="13" font-weight="700" fill="#1f2328">{title}</text>')
+    # y 그리드 + 라벨 (4단)
+    for k in range(5):
+        gv = ymax * k / 4
+        gy = Y(gv)
+        parts.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width - pad_r}" y2="{gy:.1f}" stroke="#eaecef" stroke-width="1"/>')
+        parts.append(f'<text x="{pad_l - 6}" y="{gy + 3:.1f}" font-size="10" text-anchor="end" fill="#6e7781">{gv:.1f}{value_suffix}</text>')
+    # x 라벨
+    for i, lab in enumerate(x_labels):
+        parts.append(f'<text x="{X(i):.1f}" y="{height - pad_b + 16}" font-size="10" text-anchor="middle" fill="#6e7781">{lab}</text>')
+    # 라인 + 포인트
+    for label, vals, color in series:
+        pts = [(X(i), Y(v)) for i, v in enumerate(vals) if v is not None]
+        if len(pts) >= 2:
+            d = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            parts.append(f'<polyline points="{d}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+        for x, y in pts:
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}"/>')
+    # 범례
+    lx = pad_l
+    for label, _, color in series:
+        parts.append(f'<rect x="{lx}" y="{height - 12}" width="10" height="10" rx="2" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 14}" y="{height - 3}" font-size="11" fill="#24292f">{label}</text>')
+        lx += 22 + len(label) * 8
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def _norm_ym(v) -> str | None:
     """월 헤더 문자열을 'YYYY-MM'으로 정규화. 연 2000~2099·월 1~12만 인정
     (숫자 값 '2633.0' 등을 연-월로 오인하지 않도록 범위 검증)."""

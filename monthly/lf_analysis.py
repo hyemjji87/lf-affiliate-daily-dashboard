@@ -333,8 +333,8 @@ def group_amt_table(amt_df, dates, partners, groupcol, cert_only=False) -> pd.Da
     if sub.empty:
         return pd.DataFrame(columns=[groupcol, "tot", "net"])
     sale = sub[sub["정산구분"] == "판매"]
-    tot = sale.groupby(groupcol)["거래액_VAT제외"].sum()
-    net = sub.groupby(groupcol)["거래액_VAT제외"].sum()
+    tot = sale.groupby(groupcol, observed=True)["거래액_VAT제외"].sum()
+    net = sub.groupby(groupcol, observed=True)["거래액_VAT제외"].sum()
     return pd.DataFrame({"tot": tot, "net": net}).reset_index()
 
 
@@ -352,8 +352,8 @@ def partner_full_table(amt_df, uv_df, cert_df, dates, partners=None, exclude_af=
     sub = _filter_amt(amt_df, dates, partners, cert_only=False)
     if not sub.empty:
         sale = sub[sub["정산구분"] == "판매"]
-        cust_tot = sale.groupby("제휴사")["고객번호"].nunique()
-        cust_net = sub.groupby("제휴사")["고객번호"].nunique()
+        cust_tot = sale.groupby("제휴사", observed=True)["고객번호"].nunique()
+        cust_net = sub.groupby("제휴사", observed=True)["고객번호"].nunique()
         merged["cust_tot"] = merged["제휴사"].map(cust_tot).fillna(0).astype(int)
         merged["cust_net"] = merged["제휴사"].map(cust_net).fillna(0).astype(int)
     else:

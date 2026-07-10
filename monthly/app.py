@@ -247,12 +247,47 @@ def prev_ym(ym: str) -> str:
     return f"{int(y) - 1}-{m}"
 
 
+# 월마감 모드라도 '마지막 선택월'은 미마감으로 보고 데이터의 마지막 일자까지(MTD)만 집계.
+# 전년도 비교도 동일 캘린더 일자까지 맞춰 like-for-like 비교가 되게 한다.
+_MTD_MODE = close_mode.startswith("MTD")
+_last_sel = max(sel_months) if sel_months else None
+
+
+def _month_maxdate():
+    md_ = {}
+    for df, dc in ((cur_data.get("amt"), "정산일시일"), (cur_data.get("uv"), "★일자일"),
+                   (cur_data.get("cert"), "인증일시일")):
+        if df is not None and not df.empty and "_마감" in df.columns:
+            g = df.dropna(subset=[dc]).groupby("_마감", observed=True)[dc].max()
+            for m, v in g.items():
+                d = pd.Timestamp(v).date()
+                if m not in md_ or d > md_[m]:
+                    md_[m] = d
+    return md_
+
+
+_MONTH_MAX = _month_maxdate()
+
+
+def _prev_year_date(d):
+    try:
+        return d.replace(year=d.year - 1)
+    except ValueError:
+        return d.replace(year=d.year - 1, day=28)
+
+
 def cur_dates(ym):
-    return M.month_dates(cur_data, ym, maps, mtd_day)
+    if _MTD_MODE:
+        return M.month_dates(cur_data, ym, maps, mtd_day=mtd_day)
+    cap = _MONTH_MAX.get(ym) if ym == _last_sel else None
+    return M.month_dates(cur_data, ym, maps, max_date=cap)
 
 
 def prev_dates(ym):
-    return M.month_dates(prev_data, prev_ym(ym), maps, mtd_day)
+    if _MTD_MODE:
+        return M.month_dates(prev_data, prev_ym(ym), maps, mtd_day=mtd_day)
+    cap = _MONTH_MAX.get(ym) if ym == _last_sel else None
+    return M.month_dates(prev_data, prev_ym(ym), maps, max_date=_prev_year_date(cap) if cap else None)
 
 
 def bundle_cur(ym):
@@ -289,52 +324,28 @@ METRICS = [
 ]
 
 
-tabs = st.tabs(["📊 개요", "📅 주차별", "🤝 제휴사별", "🏷 BPU별"])
+tabs = st.tabs(["📆 월별 마감", "🤝 제휴사별", "🏷 BPU별"])
 
 # ==================================================================================
-# 개요 탭
+# 월별 마감 탭
 # ==================================================================================
 with tabs[0]:
-    export_tab("개요")
-    bp = bundle_cur(primary)
-    bpp = bundle_prev(primary)
-
-    # KPI 카드 (기준월)
-    def _kpi(label, cur_v, prev_v, tgt_metric, seg="전체", unit=1, suffix=""):
-        d, dc, _ = pct_ratio(cur_v, prev_v)
-        extra = ""
-        if tgt_metric:
-            t = M.target_value(target_df, tgt_metric, primary, seg)
-            td, tc, _ = target_ratio(cur_v, t)
-            extra = f'&nbsp;·&nbsp;<span style="color:{COLOR_MAP.get(tc)};font-weight:600;">목표 {td}</span>'
-        return (label, fmt(cur_v, unit) + suffix, d, dc, extra)
-
-    sub("핵심 지표 (KPI)", f"{primary} · {paytype}")
-    cards = [
-        _kpi("UV", bp["uv"], bpp["uv"], None),
-        _kpi("인증자수", bp["cert"]["전체"], bpp["cert"]["전체"], "인증자수"),
-        _kpi("당월인증거래액 (백만)", bp["amt_cert"]["전체"][pt], bpp["amt_cert"]["전체"][pt], "당월인증거래액", unit=1_000_000),
-        _kpi("전체거래액 (백만)", bp["amt_all"]["전체"][pt], bpp["amt_all"]["전체"][pt], "거래액", unit=1_000_000),
-    ]
-    md(render_kpi_cards(cards))
-    # LF몰 대비 비중
-    lf_act = M.lfmall_value(lf_df, primary, "실제")
-    if lf_act:
-        share_all = bp["amt_all"]["전체"][pt] / lf_act * 100
-        share_cert = bp["amt_cert"]["전체"][pt] / lf_act * 100
-        md(f'<div style="font-size:13px;color:#57606a;margin:-8px 0 4px;">LF몰 전체거래액 대비 · '
-           f'전체거래액 <b>{share_all:.1f}%</b> · 당월인증거래액 <b>{share_cert:.1f}%</b></div>')
+    export_tab("월별 마감")
+    # 월별 번들은 여러 표에서 재사용하므로 월당 한 번만 계산
+    BC = {ym: bundle_cur(ym) for ym in sel_months}
+    BP = {ym: bundle_prev(ym) for ym in sel_months}
+    month_cols = [f"{int(ym[5:7])}월" for ym in sel_months]
+    _last_note = (f" · 마지막 월({_last_sel}) MTD 기준" if not _MTD_MODE and _last_sel in _MONTH_MAX else "")
 
     # 월별 실적 (행=월, 그룹=지표 실적/전년비)
-    sub("월별 실적", f"{paytype} · 거래액/객단가 단위: 당월인증거래액·전체거래액=백만, 객단가=원")
+    sub("월별 실적", f"{paytype}{_last_note} · 거래액=백만, 객단가=원, CR=%")
     groups = [(lbl, ["실적", "전년비"]) for lbl, *_ in METRICS]
     rows, crows = [], []
     for ym in sel_months:
-        bc, bpv = bundle_cur(ym), bundle_prev(ym)
+        bc, bpv = BC[ym], BP[ym]
         row, cr_ = [ym.replace("-", ".")], []
         for lbl, getter, _tm, unit in METRICS:
             cv, pv = getter(bc), getter(bpv)
-            suffix = "%" if lbl == "당월인증CR" else ""
             disp = (f"{cv:.1f}%" if lbl == "당월인증CR" else fmt(cv, unit))
             d, dc, _ = pct_ratio(cv, pv)
             row += [disp, d]
@@ -343,86 +354,73 @@ with tabs[0]:
         crows.append(cr_)
     md(render_grouped_table(groups, rows, crows, first_col_label="월"))
 
-    # 세그(신규/윈백/기존) — 기준월
-    sub(f"세그별 실적 · {primary}", "인증자수 / 당월인증거래액 / 전체거래액 (실적·비중·전년비·목표비)")
-    for metric_label, kind, tgt_metric in [
-        ("인증자수", "cert", "인증자수"),
-        ("당월인증거래액(백만)", "amt_cert", "당월인증거래액"),
-        ("전체거래액(백만)", "amt_all", "거래액"),
+    # 세그별 실적 (월별) — 지표마다 실적 / 전년비 / 목표비 표를 분리
+    def _segval(bundle, kind, seg):
+        return bundle["cert"][seg] if kind == "cert" else bundle[kind][seg][pt]
+
+    seg_order = [("신규", "신규"), ("WIN-BACK", "윈백"), ("기존", "기존")]
+    for metric_label, kind, tgt_metric, unit in [
+        ("인증자수", "cert", "인증자수", 1),
+        ("당월인증거래액(백만)", "amt_cert", "당월인증거래액", 1_000_000),
+        ("전체거래액(백만)", "amt_all", "거래액", 1_000_000),
     ]:
-        unit = 1 if kind == "cert" else 1_000_000
-        total = bp["cert"]["전체"] if kind == "cert" else bp[kind]["전체"][pt]
-        srows, scr = [], []
-        for seg in ["신규", "WIN-BACK", "기존"]:
-            if kind == "cert":
-                cv = bp["cert"][seg]
-                pv = bpp["cert"][seg]
-            else:
-                cv = bp[kind][seg][pt]
-                pv = bpp[kind][seg][pt]
-            share = f"{cv / total * 100:.1f}%" if total else "-"
-            d, dc, _ = pct_ratio(cv, pv)
-            t = M.target_value(target_df, tgt_metric, primary, M.SEG_LABEL[seg])
-            td, tc, _ = target_ratio(cv, t)
-            srows.append([M.SEG_LABEL[seg], fmt(cv, unit), share, d, td])
-            scr.append([None, None, dc, tc])
-        md(f'<div style="font-size:13px;font-weight:600;margin-top:10px;">{metric_label}</div>')
-        md(render_simple_table(["세그", "실적", "비중", "전년비", "목표비"], srows, scr))
+        sub(f"세그별 {metric_label}", "월별 · 신규/윈백/기존")
+        # 실적
+        rows = [[lbl] + [fmt(_segval(BC[ym], kind, sk), unit) for ym in sel_months] for sk, lbl in seg_order]
+        md('<div style="font-size:12px;font-weight:600;color:#57606a;margin:6px 0 2px;">실적</div>')
+        md(render_simple_table(["세그"] + month_cols, rows))
+        # 전년비
+        rows, crows = [], []
+        for sk, lbl in seg_order:
+            r, c = [lbl], []
+            for ym in sel_months:
+                d, dc, _ = pct_ratio(_segval(BC[ym], kind, sk), _segval(BP[ym], kind, sk))
+                r.append(d)
+                c.append(dc)
+            rows.append(r)
+            crows.append(c)
+        md('<div style="font-size:12px;font-weight:600;color:#57606a;margin:8px 0 2px;">전년비</div>')
+        md(render_simple_table(["세그"] + month_cols, rows, crows))
+        # 목표비
+        rows, crows = [], []
+        for sk, lbl in seg_order:
+            r, c = [lbl], []
+            for ym in sel_months:
+                t = M.target_value(target_df, tgt_metric, ym, M.SEG_LABEL[sk])
+                td, tc, _ = target_ratio(_segval(BC[ym], kind, sk), t)
+                r.append(td)
+                c.append(tc)
+            rows.append(r)
+            crows.append(c)
+        md('<div style="font-size:12px;font-weight:600;color:#57606a;margin:8px 0 2px;">목표비</div>')
+        md(render_simple_table(["세그"] + month_cols, rows, crows))
 
-    # LF몰 대비 비중 (월별)
+    # LF몰 전체 대비 비중 추이 (꺾은선: 당년 강조 / 전년 회색)
     if not lf_df.empty:
-        sub("LF몰 전체 대비 비중 (월별)")
-        rows, crows = [], []
-        for ym in sel_months:
-            bc = bundle_cur(ym)
-            lf_a = M.lfmall_value(lf_df, ym, "실제")
-            lf_t = M.lfmall_value(lf_df, ym, "목표")
-            s_all = f"{bc['amt_all']['전체'][pt] / lf_a * 100:.2f}%" if lf_a else "-"
-            s_cert = f"{bc['amt_cert']['전체'][pt] / lf_a * 100:.2f}%" if lf_a else "-"
-            rows.append([ym.replace("-", "."), fmt(lf_a, 1_000_000), fmt(lf_t, 1_000_000), s_all, s_cert])
-            crows.append([None, None, None, None])
-        md(render_simple_table(["월", "LF몰실제(백만)", "LF몰목표(백만)", "전체거래액 비중", "당월인증 비중"], rows, crows))
-
-
-# ==================================================================================
-# 주차별 탭 (목표비 제외)
-# ==================================================================================
-with tabs[1]:
-    export_tab("주차별")
-    weeks = M.weeks_of_month(cur_data, primary)
-    if not weeks:
-        st.info("주차 정보를 찾지 못했습니다(피벗 <주차기준> 확인). 기준월을 바꿔보세요.")
-    else:
-        sub(f"주차별 실적 · {primary}", f"{paytype} · 전년비는 전년 동월 주차 대비")
-        prev_weeks = M.weeks_of_month(prev_data, prev_ym(primary))
-        # 전년 주차 매칭: 같은 주차번호(YY_M_W의 W) 기준
-        prev_by_wk = {M._parse_week_label(w)[1]: w for w in prev_weeks}
-        groups = [(lbl, ["실적", "전년비"]) for lbl, *_ in METRICS]
-        rows, crows = [], []
-        for w in weeks:
-            dts = M.week_dates(cur_data, w)
-            bc = M.metric_bundle(cur_data, dts)
-            wn = M._parse_week_label(w)[1]
-            pw = prev_by_wk.get(wn)
-            bpv = M.metric_bundle(prev_data, M.week_dates(prev_data, pw)) if pw else None
-            row, cr_ = [w], []
-            for lbl, getter, _tm, unit in METRICS:
-                cv = getter(bc)
-                pv = getter(bpv) if bpv else None
-                disp = (f"{cv:.1f}%" if lbl == "당월인증CR" else fmt(cv, unit))
-                d, dc, _ = pct_ratio(cv, pv)
-                row += [disp, d]
-                cr_ += [None, dc]
-            rows.append(row)
-            crows.append(cr_)
-        md(render_grouped_table(groups, rows, crows, first_col_label="주차"))
-        st.caption("단위: 당월인증거래액·전체거래액=백만, 객단가=원, 당월인증CR=%")
+        sub("LF몰 전체 대비 비중 추이", "당년 강조색 · 전년 회색 · %")
+        cur_y = sel_months[-1][:4]
+        for metric_label, kind in [("전체거래액 비중", "amt_all"), ("당월인증거래액 비중", "amt_cert")]:
+            cur_line, prev_line = [], []
+            for ym in sel_months:
+                lf_c = M.lfmall_value(lf_df, ym, "실제")
+                cv = BC[ym][kind]["전체"][pt]
+                cur_line.append(cv / lf_c * 100 if lf_c else None)
+                lf_p = M.lfmall_value(lf_df, prev_ym(ym), "실제")
+                pv = BP[ym][kind]["전체"][pt]
+                prev_line.append(pv / lf_p * 100 if lf_p else None)
+            series = []
+            if any(v is not None for v in prev_line):
+                series.append((f"{int(cur_y) - 1} 전년", prev_line, "#8c959f"))
+            series.append((f"{cur_y} 당년", cur_line, "#0969da"))
+            md(M.svg_line_chart(month_cols, series, title=metric_label, value_suffix="%"))
+        if not any(M.lfmall_value(lf_df, prev_ym(ym), "실제") for ym in sel_months):
+            st.caption("※ 전년(회색) 선은 전년도 LF몰 전체거래액 데이터가 업로드되면 표시됩니다.")
 
 
 # ==================================================================================
 # 제휴사별 탭 (목표비 제외)
 # ==================================================================================
-with tabs[2]:
+with tabs[1]:
     export_tab("제휴사별")
     # UV·인증·거래액이 발생한 전 제휴사
     def _partners(data, dates):
@@ -462,23 +460,11 @@ with tabs[2]:
             crows.append(cr_)
         md(render_grouped_table(groups, rows, crows, first_col_label="월"))
 
-        # 제휴사 랭킹 (기준월)
-        sub(f"제휴사 랭킹 · {primary}", "당월인증거래액 내림차순")
-        pf = A.partner_full_table(cur_data["amt"], cur_data["uv"], cur_data["cert"], cur_dates(primary), plist)
-        rrows = []
-        for _, r in pf.head(30).iterrows():
-            cust = r[f"cust_{pt}"]
-            a = r[f"all_{pt}"] / cust if cust else 0
-            rrows.append([r["제휴사"], fmt(r["UV"]), fmt(r["인증수"]),
-                          fmt(r[f"cert_{pt}"], 1_000_000), fmt(r[f"all_{pt}"], 1_000_000),
-                          fmt(cust), fmt(a)])
-        md(render_simple_table(["제휴사", "UV", "인증자수", "당월인증거래액(백만)", "전체거래액(백만)", "고객수", "객단가"], rrows))
-
 
 # ==================================================================================
 # BPU별 탭 (목표비 제외 + 기여도/추가분석)
 # ==================================================================================
-with tabs[3]:
+with tabs[2]:
     export_tab("BPU별")
     dts, pdts = cur_dates(primary), prev_dates(primary)
     cert_only = st.radio("거래 범위", ["당월인증거래액", "전체거래액"], index=0, horizontal=True) == "당월인증거래액"
