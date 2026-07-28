@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+# 로컬 테스트용 데이터(집계라도 실적 수치는 커밋하지 않음). 배포용은 data/daily_pivot.json만 명시적으로 커밋.
+/scratch_*.json
