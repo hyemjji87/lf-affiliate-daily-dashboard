@@ -39,6 +39,23 @@ def zero_perf_affiliates(cur_df) -> list:
     return [a for a in s.index if float(s.get(a, 0) or 0) == 0]
 
 
+def prev_matched(all_df, months, asof, filter_af=None):
+    """전년 레코드를 당년과 '같은 기간'으로 맞춰 반환 — 전년비/합계 정합용.
+    ① 전년 월 라벨을 +1년 시프트해 당년 월과 맞추고, ② 표시된 월(months)로 제한,
+    ③ as-of 월은 as-of 일자까지만 남긴다(MTD 대 MTD).
+    ※ value_matrix의 합계는 넘긴 df 전체 월로 합산하므로, 여기서 기간을 미리 잘라야
+    합계·전년비가 당년과 같은 기간끼리 비교된다(전년 8~12월이 분모에 섞이던 버그 방지)."""
+    dp = all_df[all_df.year_tag == "prev"].copy()
+    if filter_af is not None:
+        dp = dp[dp.affiliate == filter_af]
+    dp["month"] = dp["month"].map(lambda s: C.m_shift(s, 1))
+    dp = dp[dp["month"].isin(months)]
+    if len(asof) >= 10 and asof[8:10].isdigit():
+        am, ad = asof[:7], int(asof[8:10])
+        dp = dp[~((dp["month"] == am) & (dp["day"] > ad))]
+    return dp
+
+
 # 금액 포맷은 원단위(콤마)로 — pivot_core.fmt_won의 억/만 축약 대신 여기(항상 새로 실행되는
 # 메인)에서 오버라이드해, 재배포 모듈 캐시와 무관하게 즉시 반영되게 한다.
 def fmt_won_full(v):
@@ -139,8 +156,7 @@ def build_html(df, cur_all, has_prev, asof) -> str:
         d1.columns = ["합계" if c == "합계" else C.m_label(c) for c in d1.columns]
         sections.append((f"{metric}{suffix} · 제휴사 × 월", style_values(d1, fmt_fn).to_html()))
         if has_prev:
-            dp = df[df.year_tag == "prev"].copy()
-            dp["month"] = dp["month"].map(lambda s: C.m_shift(s, 1))
+            dp = prev_matched(df, months, asof)
             pm = C.value_matrix(dp, "affiliate", "month", metric, pay, order, months)
             yy = C.yoy_matrix(m1, pm)
             yy.columns = d1.columns
@@ -287,7 +303,7 @@ with tab1:
     st.markdown(f"**{sel_m.replace('-', '.')} · {metric}** · 행=일 / 열=제휴사 "
                 f"(제휴사는 {'순결제' if pay=='net' else '총결제'} 기준 큰 순)")
     if show_yoy and has_prev:
-        dprev = df[(df.year_tag == "prev") & (df.month == C.m_shift(sel_m, -1))]
+        dprev = prev_matched(df, [sel_m], _asof)
         prev_mat = C.value_matrix(dprev, "day", "affiliate", metric, pay, idx_order, col_order)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.index = disp.index
@@ -322,11 +338,7 @@ with tab_af:
                 f"({'순결제' if pay=='net' else '총결제'} 기준) · "
                 f"{' · '.join(m.replace('-', '.') for m in sel_ms)}")
     if show_yoy and has_prev:
-        dprev = df[df.year_tag == "prev"].copy()
-        if af != "전체":
-            dprev = dprev[dprev.affiliate == af]
-        dprev["month"] = dprev["month"].map(lambda s: C.m_shift(s, 1))  # 전년 → 당년 라벨
-        dprev = dprev[dprev.month.isin(sel_ms)]
+        dprev = prev_matched(df, sel_ms, _asof, filter_af=(None if af == "전체" else af))
         prev_mat = C.value_matrix(dprev, "day", "month", metric, pay, idx_order, sel_ms)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.index, yy.columns = disp.index, disp.columns
@@ -346,8 +358,7 @@ with tab2:
     disp.columns = ["합계" if c == "합계" else C.m_label(c) for c in disp.columns]
     st.markdown(f"**{metric}** · 행=제휴사 / 열=월 ({'순결제' if pay=='net' else '총결제'} 기준)")
     if show_yoy and has_prev:
-        dprev = df[df.year_tag == "prev"].copy()
-        dprev["month"] = dprev["month"].map(lambda s: C.m_shift(s, 1))  # 전년 → 당년 라벨로 정렬
+        dprev = prev_matched(df, col_order, _asof)
         prev_mat = C.value_matrix(dprev, "affiliate", "month", metric, pay, idx_order, col_order)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.columns = disp.columns
