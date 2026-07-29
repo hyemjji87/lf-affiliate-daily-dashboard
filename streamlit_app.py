@@ -29,6 +29,20 @@ def load(raw: bytes):
     return df, payload
 
 
+def active_affiliates(d) -> set:
+    """UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사를 뺀 활성 제휴사 집합.
+    ※ pivot_core가 아닌 여기(항상 새로 실행되는 메인 스크립트)에 정의한다 —
+    Streamlit이 재배포 시 import된 헬퍼 모듈을 옛 캐시로 두어 새 함수가 없다며
+    AttributeError 나던 문제 회피."""
+    if d.empty or "affiliate" not in d.columns:
+        return set()
+    uv_by = d.groupby("affiliate")["uv"].sum() if "uv" in d.columns else {}
+    camt_by = d.groupby("affiliate")["cert_amt_tot"].sum() if "cert_amt_tot" in d.columns else {}
+    names = set(getattr(uv_by, "index", [])) | set(getattr(camt_by, "index", []))
+    return {a for a in names
+            if float(uv_by.get(a, 0) or 0) > 0 or float(camt_by.get(a, 0) or 0) > 0}
+
+
 # ── 스타일 ──────────────────────────────────────────────
 def style_values(mat, fmt_fn):
     return (mat.style
@@ -101,7 +115,7 @@ def build_html(df, cur_all, has_prev, asof) -> str:
     hl = f"{asof_day}일" if asof_day else None  # 일자 매트릭스 분석일자 강조 라벨
 
     # 활성 제휴사: UV 합 또는 당월인증거래액(총결제) 합이 0이 아닌 제휴사만 리스팅
-    active = C.active_affiliates(cur_all)
+    active = active_affiliates(cur_all)
 
     sections = []
 
@@ -221,7 +235,7 @@ cur_all = df[df.year_tag == "cur"]
 has_prev = "prev" in set(df.year_tag.unique())
 
 # 리스팅 제외 기준: UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사는 표·셀렉터에서 숨김.
-ACTIVE_AF = C.active_affiliates(cur_all)
+ACTIVE_AF = active_affiliates(cur_all)
 
 # 분석일자(as-of) 강조용 행 라벨('N일'). 일자 매트릭스에서 해당 일 행을 컬러 강조.
 _asof_day = int(_asof[8:10]) if len(_asof) >= 10 and _asof[8:10].isdigit() else None

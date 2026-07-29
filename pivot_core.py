@@ -67,18 +67,6 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def active_affiliates(d) -> set:
-    """UV 합 또는 당월인증거래액(총결제) 합이 0이 아닌 제휴사 집합.
-    둘 다 0이면 비리스팅(제거 대상). 표·리스팅·셀렉터 공통 기준."""
-    if d.empty or "affiliate" not in d.columns:
-        return set()
-    uv_by = d.groupby("affiliate")["uv"].sum() if "uv" in d.columns else {}
-    camt_by = d.groupby("affiliate")["cert_amt_tot"].sum() if "cert_amt_tot" in d.columns else {}
-    names = set(getattr(uv_by, "index", [])) | set(getattr(camt_by, "index", []))
-    return {a for a in names
-            if float(uv_by.get(a, 0) or 0) > 0 or float(camt_by.get(a, 0) or 0) > 0}
-
-
 def base_col(metric, pay):
     m = METRICS[metric]
     if not m.get("pay"):
