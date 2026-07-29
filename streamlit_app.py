@@ -47,6 +47,14 @@ def style_yoy(mat):
     return mat.style.format(f).map(color)
 
 
+def _hl_row(styler, label):
+    """일자 매트릭스에서 분석일자('N일') 행을 배경색으로 강조."""
+    if not label:
+        return styler
+    return styler.apply(
+        lambda s: ["background-color:#fff3bf" if s.name == label else "" for _ in s], axis=1)
+
+
 def _cspan(text, up):
     return f'<span style="color:{UP_COLOR if up else DOWN_COLOR};font-weight:600">{text}</span>'
 
@@ -89,6 +97,8 @@ def build_html(df, cur_all, has_prev, asof) -> str:
     제휴사 리스팅은 UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사를 제외한다."""
     import html as _h
     months = sorted(cur_all.month.unique())
+    asof_day = int(asof[8:10]) if len(asof) >= 10 and asof[8:10].isdigit() else None
+    hl = f"{asof_day}일" if asof_day else None  # 일자 매트릭스 분석일자 강조 라벨
 
     # 활성 제휴사: UV 합 또는 당월인증거래액(총결제) 합이 0이 아닌 제휴사만 리스팅
     uv_by = cur_all.groupby("affiliate")["uv"].sum()
@@ -128,18 +138,23 @@ def build_html(df, cur_all, has_prev, asof) -> str:
         d3 = m3.copy()
         d3.index = ["합계" if i == "합계" else f"{int(i)}일" for i in d3.index]
         d3.columns = ["합계" if c == "합계" else C.m_label(c) for c in d3.columns]
-        sections.append((f"{metric}{suffix} · 전체 일자 × 월", style_values(d3, fmt_fn).to_html()))
+        sections.append((f"{metric}{suffix} · 전체 일자 × 월",
+                         _hl_row(style_values(d3, fmt_fn), hl).to_html()))
 
     body = "\n".join(f"<h2>{_h.escape(t)}</h2>{h}" for t, h in sections)
     return (
         '<!doctype html><html lang="ko"><head><meta charset="utf-8">'
         "<title>LF몰 제휴 일자별 실적 집계</title><style>"
-        "body{font-family:system-ui,'Malgun Gothic',sans-serif;margin:24px;color:#111}"
-        "h1{font-size:1.3rem;margin-bottom:.2rem}"
-        "h2{font-size:1rem;margin:1.6rem 0 .4rem;border-left:4px solid #6366f1;padding-left:8px}"
-        "table{border-collapse:collapse;font-size:.78rem}"
-        "td,th{border:1px solid #e5e7eb;padding:3px 7px;text-align:right;white-space:nowrap}"
-        ".cap{color:#6b7280;font-size:.8rem}</style></head><body>"
+        "body{font-family:system-ui,'Malgun Gothic',sans-serif;margin:24px;color:#111;font-size:14px;line-height:1.45}"
+        "h1{font-size:1.45rem;margin:0 0 .3rem}"
+        "h2{font-size:1.05rem;margin:1.9rem 0 .5rem;border-left:4px solid #6366f1;padding-left:9px}"
+        "table{border-collapse:collapse;font-size:.85rem;font-variant-numeric:tabular-nums;margin:.3rem 0 1.1rem}"
+        "th,td{border:1px solid #e5e7eb;padding:5px 10px;white-space:nowrap}"
+        ".data{text-align:right}"
+        ".col_heading,.blank{background:#eef1f6;text-align:center;font-weight:600}"
+        ".row_heading{text-align:left;font-weight:500}"
+        "tbody tr:hover .data{background:#f6f7f9}"
+        ".cap{color:#6b7280;font-size:.82rem;margin:.15rem 0}</style></head><body>"
         "<h1>🗓️ LF몰 제휴 일자별 실적 집계</h1>"
         f'<div class="cap">지표: UV · 인증자수 · 당월인증거래액(총결제) · 기준 {_h.escape(asof or "-")} '
         "· 전년비 상승 ▼(초록)/하락 △(빨강) · 제휴사 리스팅은 UV·당월인증거래액 합계 0 제외</div>"
@@ -179,8 +194,24 @@ if df.empty or "cur" not in set(df.year_tag.unique()):
 _asof = payload.get("generated_mtd_end", "")
 st.sidebar.success(f"로드: {src}" + (f" · 기준 {_asof}" if _asof else ""))
 
+# 표·합계에서 제외할 비리스팅 파트너. 기본값은 내보낸 JSON의 exclude_listing(비공개 앱에서 지정).
+_avail_af = sorted(df.affiliate.unique())
+with st.sidebar:
+    st.header("제외 제휴사")
+    excl = st.multiselect(
+        "리스팅 제외", _avail_af,
+        default=[a for a in payload.get("exclude_listing", []) if a in _avail_af],
+        help="선택한 제휴사를 UV·인증자수·당월인증거래액 등 모든 표·합계에서 제외(비리스팅 파트너). "
+             "기본값은 내보낸 JSON에 지정된 목록.")
+if excl:
+    df = df[~df.affiliate.isin(excl)]
+
 cur_all = df[df.year_tag == "cur"]
 has_prev = "prev" in set(df.year_tag.unique())
+
+# 분석일자(as-of) 강조용 행 라벨('N일'). 일자 매트릭스에서 해당 일 행을 컬러 강조.
+_asof_day = int(_asof[8:10]) if len(_asof) >= 10 and _asof[8:10].isdigit() else None
+HL_LABEL = f"{_asof_day}일" if _asof_day else None
 
 with st.sidebar:
     st.header("지표")
@@ -228,9 +259,9 @@ with tab1:
         prev_mat = C.value_matrix(dprev, "day", "affiliate", metric, pay, idx_order, col_order)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.index = disp.index
-        st.dataframe(style_yoy(yy), use_container_width=True, height=560)
+        st.dataframe(_hl_row(style_yoy(yy), HL_LABEL), use_container_width=True, height=560)
     else:
-        st.dataframe(style_values(disp, fmt_fn), use_container_width=True, height=560)
+        st.dataframe(_hl_row(style_values(disp, fmt_fn), HL_LABEL), use_container_width=True, height=560)
 
 # ── 뷰: 제휴사 · 일자 × 월 (한 제휴사 필터 + 월 다중선택) ──
 with tab_af:
@@ -267,9 +298,9 @@ with tab_af:
         prev_mat = C.value_matrix(dprev, "day", "month", metric, pay, idx_order, sel_ms)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.index, yy.columns = disp.index, disp.columns
-        st.dataframe(style_yoy(yy), use_container_width=True, height=620)
+        st.dataframe(_hl_row(style_yoy(yy), HL_LABEL), use_container_width=True, height=620)
     else:
-        st.dataframe(style_values(disp, fmt_fn), use_container_width=True, height=620)
+        st.dataframe(_hl_row(style_values(disp, fmt_fn), HL_LABEL), use_container_width=True, height=620)
     st.caption("한 제휴사의 여러 달 일자별 흐름을 나란히 비교(예: 삼성카드 5·6·7월 UV). "
                "전년비 토글 시 각 셀=전년 동일 캘린더일 대비.")
 
