@@ -128,7 +128,8 @@ with st.sidebar:
                            help="켜면 값 대신 전년 동기 대비 증감률(▼초록/△빨강)로 표시")
     fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
 
-tab1, tab2, tab3 = st.tabs(["📅 날짜 × 제휴사", "🏢 제휴사 × 월", "💬 분석일 코멘트"])
+tab1, tab_af, tab2, tab3 = st.tabs(
+    ["📅 날짜 × 제휴사", "🔎 제휴사 · 일자×월", "🏢 제휴사 × 월", "💬 분석일 코멘트"])
 
 # ── 뷰1: 날짜 × 제휴사 (한 달) ──
 with tab1:
@@ -152,6 +153,43 @@ with tab1:
         st.dataframe(style_yoy(yy), use_container_width=True, height=560)
     else:
         st.dataframe(style_values(disp, fmt_fn), use_container_width=True, height=560)
+
+# ── 뷰: 제휴사 · 일자 × 월 (한 제휴사 필터 + 월 다중선택) ──
+with tab_af:
+    all_months = sorted(cur_all.month.unique())
+    ac1, ac2 = st.columns([1.2, 2])
+    with ac1:
+        aff_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
+                         .sort_values(ascending=False).index)
+        af = st.selectbox("제휴사", aff_order, index=0, key="afdx_af")
+    with ac2:
+        sel_ms = st.multiselect("월 (다중 선택)", all_months,
+                                default=all_months[-3:] if len(all_months) >= 3 else all_months,
+                                format_func=lambda m: m.replace("-", "년 ") + "월", key="afdx_ms")
+    if not sel_ms:
+        sel_ms = all_months[-1:]
+    sel_ms = sorted(sel_ms)
+    d = cur_all[(cur_all.affiliate == af) & (cur_all.month.isin(sel_ms))]
+    idx_order = sorted(d.day.unique())
+    cur_mat = C.value_matrix(d, "day", "month", metric, pay, idx_order, sel_ms)
+    disp = cur_mat.copy()
+    disp.index = ["합계" if i == "합계" else f"{int(i)}일" for i in disp.index]
+    disp.columns = ["합계" if c == "합계" else C.m_label(c) for c in disp.columns]
+    st.markdown(f"**{af} · {metric}** · 행=일 / 열=월 "
+                f"({'순결제' if pay=='net' else '총결제'} 기준) · "
+                f"{' · '.join(m.replace('-', '.') for m in sel_ms)}")
+    if show_yoy and has_prev:
+        dprev = df[(df.year_tag == "prev") & (df.affiliate == af)].copy()
+        dprev["month"] = dprev["month"].map(lambda s: C.m_shift(s, 1))  # 전년 → 당년 라벨
+        dprev = dprev[dprev.month.isin(sel_ms)]
+        prev_mat = C.value_matrix(dprev, "day", "month", metric, pay, idx_order, sel_ms)
+        yy = C.yoy_matrix(cur_mat, prev_mat)
+        yy.index, yy.columns = disp.index, disp.columns
+        st.dataframe(style_yoy(yy), use_container_width=True, height=620)
+    else:
+        st.dataframe(style_values(disp, fmt_fn), use_container_width=True, height=620)
+    st.caption("한 제휴사의 여러 달 일자별 흐름을 나란히 비교(예: 삼성카드 5·6·7월 UV). "
+               "전년비 토글 시 각 셀=전년 동일 캘린더일 대비.")
 
 # ── 뷰2: 제휴사 × 월 ──
 with tab2:
