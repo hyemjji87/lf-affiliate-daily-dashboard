@@ -32,7 +32,7 @@ def load(raw: bytes):
 # ── 스타일 ──────────────────────────────────────────────
 def style_values(mat, fmt_fn):
     return (mat.style
-            .format(fmt_fn)
+            .format(fmt_fn, na_rep="")
             .apply(lambda s: ["font-weight:700" if s.name == "합계" else "" for _ in s], axis=1)
             .set_properties(subset=["합계"], **{"font-weight": "700"}))
 
@@ -44,7 +44,7 @@ def style_yoy(mat):
     def color(v):
         return "" if C.na(v) else (f"color:{UP_COLOR}" if v >= 0 else f"color:{DOWN_COLOR}")
 
-    return mat.style.format(f).map(color)
+    return mat.style.format(f, na_rep="").map(color)
 
 
 def _hl_row(styler, label):
@@ -101,10 +101,7 @@ def build_html(df, cur_all, has_prev, asof) -> str:
     hl = f"{asof_day}일" if asof_day else None  # 일자 매트릭스 분석일자 강조 라벨
 
     # 활성 제휴사: UV 합 또는 당월인증거래액(총결제) 합이 0이 아닌 제휴사만 리스팅
-    uv_by = cur_all.groupby("affiliate")["uv"].sum()
-    camt_by = cur_all.groupby("affiliate")["cert_amt_tot"].sum()
-    active = {a for a in set(uv_by.index) | set(camt_by.index)
-              if float(uv_by.get(a, 0)) > 0 or float(camt_by.get(a, 0)) > 0}
+    active = C.active_affiliates(cur_all)
 
     sections = []
 
@@ -223,6 +220,9 @@ if excl:
 cur_all = df[df.year_tag == "cur"]
 has_prev = "prev" in set(df.year_tag.unique())
 
+# 리스팅 제외 기준: UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사는 표·셀렉터에서 숨김.
+ACTIVE_AF = C.active_affiliates(cur_all)
+
 # 분석일자(as-of) 강조용 행 라벨('N일'). 일자 매트릭스에서 해당 일 행을 컬러 강조.
 _asof_day = int(_asof[8:10]) if len(_asof) >= 10 and _asof[8:10].isdigit() else None
 HL_LABEL = f"{_asof_day}일" if _asof_day else None
@@ -261,7 +261,7 @@ with tab1:
                          format_func=lambda m: m.replace("-", "년 ") + "월")
     dcur = cur_all[cur_all.month == sel_m]
     aff_tot = C.agg_value(dcur, "affiliate", metric, pay).sort_values(ascending=False)
-    col_order = [a for a in aff_tot.index if not C.na(aff_tot[a])]
+    col_order = [a for a in aff_tot.index if not C.na(aff_tot[a]) and a in ACTIVE_AF]
     idx_order = sorted(dcur.day.unique())
     cur_mat = C.value_matrix(dcur, "day", "affiliate", metric, pay, idx_order, col_order)
     disp = cur_mat.copy()
@@ -282,8 +282,8 @@ with tab_af:
     all_months = sorted(cur_all.month.unique())
     ac1, ac2 = st.columns([1.2, 2])
     with ac1:
-        aff_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
-                         .sort_values(ascending=False).index)
+        aff_order = [a for a in C.agg_value(cur_all, "affiliate", metric, pay)
+                     .sort_values(ascending=False).index if a in ACTIVE_AF]
         af = st.selectbox("제휴사", ["전체"] + aff_order, index=0, key="afdx_af")
     with ac2:
         sel_ms = st.multiselect("월 (다중 선택)", all_months,
@@ -320,7 +320,8 @@ with tab_af:
 
 # ── 뷰2: 제휴사 × 월 ──
 with tab2:
-    idx_order = list(C.agg_value(cur_all, "affiliate", metric, pay).sort_values(ascending=False).index)
+    idx_order = [a for a in C.agg_value(cur_all, "affiliate", metric, pay)
+                 .sort_values(ascending=False).index if a in ACTIVE_AF]
     col_order = sorted(cur_all.month.unique())
     cur_mat = C.value_matrix(cur_all, "affiliate", "month", metric, pay, idx_order, col_order)
     disp = cur_mat.copy()
@@ -343,8 +344,8 @@ with tab3:
     with c1:
         day_date = st.selectbox("분석일", dates, index=len(dates) - 1)
     with c2:
-        affs = ["전체"] + list(C.agg_value(cur_all, "affiliate", "당월인증거래액", "net")
-                               .sort_values(ascending=False).index)
+        affs = ["전체"] + [a for a in C.agg_value(cur_all, "affiliate", "당월인증거래액", "net")
+                           .sort_values(ascending=False).index if a in ACTIVE_AF]
         aff_sel = st.selectbox("제휴사", affs, index=0)
     st.markdown(f"#### {day_date} · {aff_sel} · {'순결제' if pay=='net' else '총결제'}")
     res = C.analyze_day(df, day_date, aff_sel, pay)
