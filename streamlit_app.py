@@ -1,4 +1,4 @@
-"""streamlit_app.py — LF 제휴 일자별 피벗 (경량, UI 전용)
+"""streamlit_app.py — LF몰 제휴 일자별 실적 집계 (경량, UI 전용)
 
 kimhyemin 본 대시보드에서 내보낸 (날짜×제휴사) 집계 JSON만 읽어
 날짜×제휴사 / 제휴사×월 피벗과 '분석일 특이점 코멘트'를 즉시 보여준다.
@@ -14,7 +14,7 @@ import streamlit as st
 
 import pivot_core as C
 
-st.set_page_config(page_title="LF 제휴 일자별 피벗", page_icon="🗓️", layout="wide")
+st.set_page_config(page_title="LF몰 제휴 일자별 실적 집계", page_icon="🗓️", layout="wide")
 
 UP_COLOR = "#059669"    # 상승(초록)
 DOWN_COLOR = "#dc2626"  # 하락(빨강)
@@ -84,8 +84,64 @@ def comment_html(res: dict) -> str:
     return html
 
 
+def build_html(df, cur_all, metric, pay, has_prev, fmt_fn, asof) -> str:
+    """현재 지표·결제구분 기준 주요 표를 정적 HTML 1개(자체완결)로. Styler.to_html 사용."""
+    import html as _h
+    pay_l = "순결제" if pay == "net" else "총결제"
+    months = sorted(cur_all.month.unique())
+    blocks = []
+
+    # 1) 제휴사 × 월 (당년 + 전년비)
+    idx = list(C.agg_value(cur_all, "affiliate", metric, pay).sort_values(ascending=False).index)
+    m1 = C.value_matrix(cur_all, "affiliate", "month", metric, pay, idx, months)
+    d1 = m1.copy()
+    d1.columns = ["합계" if c == "합계" else C.m_label(c) for c in d1.columns]
+    blocks.append(("제휴사 × 월", style_values(d1, fmt_fn).to_html()))
+    if has_prev:
+        dp = df[df.year_tag == "prev"].copy()
+        dp["month"] = dp["month"].map(lambda s: C.m_shift(s, 1))
+        pm = C.value_matrix(dp, "affiliate", "month", metric, pay, idx, months)
+        yy = C.yoy_matrix(m1, pm)
+        yy.columns = d1.columns
+        blocks.append(("제휴사 × 월 (전년비 %)", style_yoy(yy).to_html()))
+
+    # 2) 날짜 × 제휴사 (최근월)
+    last = months[-1]
+    dc = cur_all[cur_all.month == last]
+    aff = list(C.agg_value(dc, "affiliate", metric, pay).sort_values(ascending=False).index)
+    m2 = C.value_matrix(dc, "day", "affiliate", metric, pay, sorted(dc.day.unique()), aff)
+    d2 = m2.copy()
+    d2.index = ["합계" if i == "합계" else f"{int(i)}일" for i in d2.index]
+    blocks.append((f"날짜 × 제휴사 · {last.replace('-', '.')}", style_values(d2, fmt_fn).to_html()))
+
+    # 3) 전체 제휴사 · 일자 × 월
+    m3 = C.value_matrix(cur_all, "day", "month", metric, pay, sorted(cur_all.day.unique()), months)
+    d3 = m3.copy()
+    d3.index = ["합계" if i == "합계" else f"{int(i)}일" for i in d3.index]
+    d3.columns = ["합계" if c == "합계" else C.m_label(c) for c in d3.columns]
+    blocks.append(("전체 제휴사 · 일자 × 월", style_values(d3, fmt_fn).to_html()))
+
+    body = "\n".join(f"<h2>{_h.escape(t)}</h2>{h}" for t, h in blocks)
+    return (
+        '<!doctype html><html lang="ko"><head><meta charset="utf-8">'
+        "<title>LF몰 제휴 일자별 실적 집계</title><style>"
+        "body{font-family:system-ui,'Malgun Gothic',sans-serif;margin:24px;color:#111}"
+        "h1{font-size:1.3rem;margin-bottom:.2rem}"
+        "h2{font-size:1rem;margin:1.6rem 0 .4rem;border-left:4px solid #6366f1;padding-left:8px}"
+        "table{border-collapse:collapse;font-size:.78rem}"
+        "td,th{border:1px solid #e5e7eb;padding:3px 7px;text-align:right;white-space:nowrap}"
+        ".cap{color:#6b7280;font-size:.8rem}</style></head><body>"
+        "<h1>🗓️ LF몰 제휴 일자별 실적 집계</h1>"
+        f'<div class="cap">지표: {_h.escape(metric)} · {pay_l} · 기준 {_h.escape(asof or "-")} '
+        "· 전년비 상승 ▼(초록)/하락 △(빨강)</div>"
+        f"{body}"
+        '<div class="cap" style="margin-top:1.6rem">※ (날짜×제휴사) 집계 기반 · 세그·목표비 제외 · 개인정보 없음</div>'
+        "</body></html>"
+    )
+
+
 # ══════════════════════════════════════════════════════════
-st.title("🗓️ LF 제휴 일자별 피벗")
+st.title("🗓️ LF몰 제휴 일자별 실적 집계")
 st.caption("본 대시보드(kimhyemin)에서 내보낸 (날짜×제휴사) 집계만 읽는 경량 앱 · "
            "전년비 상승 ▼(초록)/하락 △(빨강)")
 
@@ -128,6 +184,19 @@ with st.sidebar:
                            help="켜면 값 대신 전년 동기 대비 증감률(▼초록/△빨강)로 표시")
     fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
 
+with st.sidebar:
+    st.header("내보내기")
+    try:
+        _report = build_html(df, cur_all, metric, pay, has_prev, fmt_fn, _asof)
+        st.download_button(
+            "⬇️ HTML 내보내기", data=_report.encode("utf-8"),
+            file_name=f"lf_daily_{(_asof or 'export').replace('-', '')}.html",
+            mime="text/html", use_container_width=True,
+            help="현재 지표·결제구분 기준 주요 표(제휴사×월+전년비, 날짜×제휴사 최근월, "
+                 "전체 일자×월)를 정적 HTML 1개로. 앱 없이 열람·공유 가능.")
+    except Exception as _he:
+        st.caption(f"⚠️ HTML 생성 오류: {_he}")
+
 tab1, tab_af, tab2, tab3 = st.tabs(
     ["📅 날짜 × 제휴사", "🔎 제휴사 · 일자×월", "🏢 제휴사 × 월", "💬 분석일 코멘트"])
 
@@ -161,7 +230,7 @@ with tab_af:
     with ac1:
         aff_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
                          .sort_values(ascending=False).index)
-        af = st.selectbox("제휴사", aff_order, index=0, key="afdx_af")
+        af = st.selectbox("제휴사", ["전체"] + aff_order, index=0, key="afdx_af")
     with ac2:
         sel_ms = st.multiselect("월 (다중 선택)", all_months,
                                 default=all_months[-3:] if len(all_months) >= 3 else all_months,
@@ -169,7 +238,9 @@ with tab_af:
     if not sel_ms:
         sel_ms = all_months[-1:]
     sel_ms = sorted(sel_ms)
-    d = cur_all[(cur_all.affiliate == af) & (cur_all.month.isin(sel_ms))]
+    d = cur_all[cur_all.month.isin(sel_ms)]
+    if af != "전체":
+        d = d[d.affiliate == af]
     idx_order = sorted(d.day.unique())
     cur_mat = C.value_matrix(d, "day", "month", metric, pay, idx_order, sel_ms)
     disp = cur_mat.copy()
@@ -179,7 +250,9 @@ with tab_af:
                 f"({'순결제' if pay=='net' else '총결제'} 기준) · "
                 f"{' · '.join(m.replace('-', '.') for m in sel_ms)}")
     if show_yoy and has_prev:
-        dprev = df[(df.year_tag == "prev") & (df.affiliate == af)].copy()
+        dprev = df[df.year_tag == "prev"].copy()
+        if af != "전체":
+            dprev = dprev[dprev.affiliate == af]
         dprev["month"] = dprev["month"].map(lambda s: C.m_shift(s, 1))  # 전년 → 당년 라벨
         dprev = dprev[dprev.month.isin(sel_ms)]
         prev_mat = C.value_matrix(dprev, "day", "month", metric, pay, idx_order, sel_ms)
