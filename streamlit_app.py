@@ -29,18 +29,14 @@ def load(raw: bytes):
     return df, payload
 
 
-def active_affiliates(d) -> set:
-    """UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사를 뺀 활성 제휴사 집합.
-    ※ pivot_core가 아닌 여기(항상 새로 실행되는 메인 스크립트)에 정의한다 —
-    Streamlit이 재배포 시 import된 헬퍼 모듈을 옛 캐시로 두어 새 함수가 없다며
-    AttributeError 나던 문제 회피."""
-    if d.empty or "affiliate" not in d.columns:
-        return set()
-    uv_by = d.groupby("affiliate")["uv"].sum() if "uv" in d.columns else {}
-    camt_by = d.groupby("affiliate")["cert_amt_tot"].sum() if "cert_amt_tot" in d.columns else {}
-    names = set(getattr(uv_by, "index", [])) | set(getattr(camt_by, "index", []))
-    return {a for a in names
-            if float(uv_by.get(a, 0) or 0) > 0 or float(camt_by.get(a, 0) or 0) > 0}
+def zero_perf_affiliates(cur_df) -> list:
+    """당월인증거래액(순결제) 합계가 0인 제휴사 = 실적 없음. 「리스팅 제외」 기본 포함 후보.
+    ※ pivot_core가 아닌 여기(항상 새로 실행되는 메인 스크립트)에 정의 —
+    Streamlit 재배포가 import된 헬퍼 모듈을 옛 캐시로 두어 새 함수를 못 찾던 문제 회피."""
+    if cur_df.empty or "cert_amt_net" not in cur_df.columns:
+        return []
+    s = cur_df.groupby("affiliate")["cert_amt_net"].sum()
+    return [a for a in s.index if float(s.get(a, 0) or 0) == 0]
 
 
 # ── 스타일 ──────────────────────────────────────────────
@@ -108,14 +104,11 @@ def comment_html(res: dict) -> str:
 
 def build_html(df, cur_all, has_prev, asof) -> str:
     """UV·인증자수·당월인증거래액(총결제) 리포트를 정적 HTML 1개로. Total 코멘트 포함.
-    제휴사 리스팅은 UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사를 제외한다."""
+    각 지표 표는 그 지표 합계가 0인 제휴사를 리스팅에서 제외한다."""
     import html as _h
     months = sorted(cur_all.month.unique())
     asof_day = int(asof[8:10]) if len(asof) >= 10 and asof[8:10].isdigit() else None
     hl = f"{asof_day}일" if asof_day else None  # 일자 매트릭스 분석일자 강조 라벨
-
-    # 활성 제휴사: UV 합 또는 당월인증거래액(총결제) 합이 0이 아닌 제휴사만 리스팅
-    active = active_affiliates(cur_all)
 
     sections = []
 
@@ -128,8 +121,8 @@ def build_html(df, cur_all, has_prev, asof) -> str:
     for metric, pay in [("UV", "net"), ("인증자수", "net"), ("당월인증거래액", "tot")]:
         fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
         suffix = " (총결제)" if metric == "당월인증거래액" else ""
-        order = [a for a in C.agg_value(cur_all, "affiliate", metric, pay)
-                 .sort_values(ascending=False).index if a in active]
+        order = list(C.agg_value(cur_all, "affiliate", metric, pay)
+                     .sort_values(ascending=False).index)
 
         # 제휴사 × 월 (당년 + 전년비)
         m1 = C.value_matrix(cur_all, "affiliate", "month", metric, pay, order, months)
@@ -210,7 +203,10 @@ st.sidebar.success(f"로드: {src}" + (f" · 기준 {_asof}" if _asof else ""))
 # 세션 상태에 기본 제외목록을 강제 주입한 뒤 위젯을 key로 바인딩한다.
 _avail_af = sorted(df.affiliate.unique())
 _excl_listing = payload.get("exclude_listing", []) or []
-_excl_default = [a for a in _excl_listing if a in _avail_af]
+# 기본 제외 = ① JSON의 비리스팅 파트너(exclude_listing) + ② 당월인증거래액(순결제) 실적 0인 제휴사.
+# ②는 숨기지 않고 칩으로 노출해 사용자가 빼고 싶으면 뺄 수 있게 한다.
+_zero_af = zero_perf_affiliates(df[df.year_tag == "cur"])
+_excl_default = [a for a in _avail_af if a in set(_excl_listing) | set(_zero_af)]
 _excl_sig = f"{_asof}|{len(df)}|{len(_avail_af)}"
 if st.session_state.get("_excl_sig") != _excl_sig:
     st.session_state["_excl_sig"] = _excl_sig
@@ -219,23 +215,22 @@ with st.sidebar:
     st.header("제외 제휴사")
     excl = st.multiselect(
         "리스팅 제외", _avail_af, key="excl_ms",
-        help="선택 제휴사를 UV·인증자수·당월인증거래액 등 모든 표·합계에서 제외(비리스팅 파트너). "
-             "기본값은 내보낸 JSON의 exclude_listing.")
+        help="선택 제휴사를 UV·인증자수·당월인증거래액 등 모든 표·합계에서 제외. 기본값 = "
+             "내보낸 JSON의 exclude_listing + 당월인증거래액 실적 0인 제휴사(빼고 싶으면 칩에서 제거).")
+    _n_zero = len([a for a in _zero_af if a in _avail_af])
+    _cap = []
     if _excl_listing:
         _miss = [a for a in _excl_listing if a not in _avail_af]
-        st.caption(f"기본 제외목록 {len(_excl_listing)}개 인식"
-                   + (f" · 데이터에 없어 미적용: {', '.join(_miss)}" if _miss else " · 전부 적용됨"))
+        _cap.append(f"기본 제외목록 {len(_excl_listing)}개" + (f"(미적용: {', '.join(_miss)})" if _miss else ""))
     else:
-        st.caption("⚠️ 이 JSON엔 기본 제외목록이 없어요 — kimhyemin에서 **재내보내기** 후 "
-                   "업로드하면 자동 선택됩니다. (지금은 위에서 직접 선택 가능)")
+        _cap.append("⚠️ JSON에 기본 제외목록 없음 — kimhyemin 재내보내기 권장")
+    _cap.append(f"실적(당월인증거래액) 0 제휴사 {_n_zero}곳 자동 포함")
+    st.caption(" · ".join(_cap))
 if excl:
     df = df[~df.affiliate.isin(excl)]
 
 cur_all = df[df.year_tag == "cur"]
 has_prev = "prev" in set(df.year_tag.unique())
-
-# 리스팅 제외 기준: UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사는 표·셀렉터에서 숨김.
-ACTIVE_AF = active_affiliates(cur_all)
 
 # 분석일자(as-of) 강조용 행 라벨('N일'). 일자 매트릭스에서 해당 일 행을 컬러 강조.
 _asof_day = int(_asof[8:10]) if len(_asof) >= 10 and _asof[8:10].isdigit() else None
@@ -275,7 +270,7 @@ with tab1:
                          format_func=lambda m: m.replace("-", "년 ") + "월")
     dcur = cur_all[cur_all.month == sel_m]
     aff_tot = C.agg_value(dcur, "affiliate", metric, pay).sort_values(ascending=False)
-    col_order = [a for a in aff_tot.index if not C.na(aff_tot[a]) and a in ACTIVE_AF]
+    col_order = [a for a in aff_tot.index if not C.na(aff_tot[a])]
     idx_order = sorted(dcur.day.unique())
     cur_mat = C.value_matrix(dcur, "day", "affiliate", metric, pay, idx_order, col_order)
     disp = cur_mat.copy()
@@ -296,8 +291,8 @@ with tab_af:
     all_months = sorted(cur_all.month.unique())
     ac1, ac2 = st.columns([1.2, 2])
     with ac1:
-        aff_order = [a for a in C.agg_value(cur_all, "affiliate", metric, pay)
-                     .sort_values(ascending=False).index if a in ACTIVE_AF]
+        aff_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
+                         .sort_values(ascending=False).index)
         af = st.selectbox("제휴사", ["전체"] + aff_order, index=0, key="afdx_af")
     with ac2:
         sel_ms = st.multiselect("월 (다중 선택)", all_months,
@@ -334,8 +329,8 @@ with tab_af:
 
 # ── 뷰2: 제휴사 × 월 ──
 with tab2:
-    idx_order = [a for a in C.agg_value(cur_all, "affiliate", metric, pay)
-                 .sort_values(ascending=False).index if a in ACTIVE_AF]
+    idx_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
+                     .sort_values(ascending=False).index)
     col_order = sorted(cur_all.month.unique())
     cur_mat = C.value_matrix(cur_all, "affiliate", "month", metric, pay, idx_order, col_order)
     disp = cur_mat.copy()
@@ -358,8 +353,8 @@ with tab3:
     with c1:
         day_date = st.selectbox("분석일", dates, index=len(dates) - 1)
     with c2:
-        affs = ["전체"] + [a for a in C.agg_value(cur_all, "affiliate", "당월인증거래액", "net")
-                           .sort_values(ascending=False).index if a in ACTIVE_AF]
+        affs = ["전체"] + list(C.agg_value(cur_all, "affiliate", "당월인증거래액", "net")
+                               .sort_values(ascending=False).index)
         aff_sel = st.selectbox("제휴사", affs, index=0)
     st.markdown(f"#### {day_date} · {aff_sel} · {'순결제' if pay=='net' else '총결제'}")
     res = C.analyze_day(df, day_date, aff_sel, pay)
