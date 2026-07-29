@@ -84,44 +84,53 @@ def comment_html(res: dict) -> str:
     return html
 
 
-def build_html(df, cur_all, metric, pay, has_prev, fmt_fn, asof) -> str:
-    """현재 지표·결제구분 기준 주요 표를 정적 HTML 1개(자체완결)로. Styler.to_html 사용."""
+def build_html(df, cur_all, has_prev, asof) -> str:
+    """UV·인증자수·당월인증거래액(총결제) 리포트를 정적 HTML 1개로. Total 코멘트 포함.
+    제휴사 리스팅은 UV·당월인증거래액(총결제) 합계가 둘 다 0인 제휴사를 제외한다."""
     import html as _h
-    pay_l = "순결제" if pay == "net" else "총결제"
     months = sorted(cur_all.month.unique())
-    blocks = []
 
-    # 1) 제휴사 × 월 (당년 + 전년비)
-    idx = list(C.agg_value(cur_all, "affiliate", metric, pay).sort_values(ascending=False).index)
-    m1 = C.value_matrix(cur_all, "affiliate", "month", metric, pay, idx, months)
-    d1 = m1.copy()
-    d1.columns = ["합계" if c == "합계" else C.m_label(c) for c in d1.columns]
-    blocks.append(("제휴사 × 월", style_values(d1, fmt_fn).to_html()))
-    if has_prev:
-        dp = df[df.year_tag == "prev"].copy()
-        dp["month"] = dp["month"].map(lambda s: C.m_shift(s, 1))
-        pm = C.value_matrix(dp, "affiliate", "month", metric, pay, idx, months)
-        yy = C.yoy_matrix(m1, pm)
-        yy.columns = d1.columns
-        blocks.append(("제휴사 × 월 (전년비 %)", style_yoy(yy).to_html()))
+    # 활성 제휴사: UV 합 또는 당월인증거래액(총결제) 합이 0이 아닌 제휴사만 리스팅
+    uv_by = cur_all.groupby("affiliate")["uv"].sum()
+    camt_by = cur_all.groupby("affiliate")["cert_amt_tot"].sum()
+    active = {a for a in set(uv_by.index) | set(camt_by.index)
+              if float(uv_by.get(a, 0)) > 0 or float(camt_by.get(a, 0)) > 0}
 
-    # 2) 날짜 × 제휴사 (최근월)
-    last = months[-1]
-    dc = cur_all[cur_all.month == last]
-    aff = list(C.agg_value(dc, "affiliate", metric, pay).sort_values(ascending=False).index)
-    m2 = C.value_matrix(dc, "day", "affiliate", metric, pay, sorted(dc.day.unique()), aff)
-    d2 = m2.copy()
-    d2.index = ["합계" if i == "합계" else f"{int(i)}일" for i in d2.index]
-    blocks.append((f"날짜 × 제휴사 · {last.replace('-', '.')}", style_values(d2, fmt_fn).to_html()))
+    sections = []
 
-    # 3) 전체 제휴사 · 일자 × 월
-    m3 = C.value_matrix(cur_all, "day", "month", metric, pay, sorted(cur_all.day.unique()), months)
-    d3 = m3.copy()
-    d3.index = ["합계" if i == "합계" else f"{int(i)}일" for i in d3.index]
-    d3.columns = ["합계" if c == "합계" else C.m_label(c) for c in d3.columns]
-    blocks.append(("전체 제휴사 · 일자 × 월", style_values(d3, fmt_fn).to_html()))
+    # 0) Total 코멘트 (최근 분석일 · 전체 · 총결제)
+    last_date = max(cur_all.date)
+    res = C.analyze_day(df, last_date, "전체", "tot")
+    sections.append((f"📌 Total 코멘트 · {last_date} · 전체 · 총결제", comment_html(res)))
 
-    body = "\n".join(f"<h2>{_h.escape(t)}</h2>{h}" for t, h in blocks)
+    # 지표별: 당월인증거래액은 총결제(tot), UV·인증자수는 결제구분 무관(net)
+    for metric, pay in [("UV", "net"), ("인증자수", "net"), ("당월인증거래액", "tot")]:
+        fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
+        suffix = " (총결제)" if metric == "당월인증거래액" else ""
+        order = [a for a in C.agg_value(cur_all, "affiliate", metric, pay)
+                 .sort_values(ascending=False).index if a in active]
+
+        # 제휴사 × 월 (당년 + 전년비)
+        m1 = C.value_matrix(cur_all, "affiliate", "month", metric, pay, order, months)
+        d1 = m1.copy()
+        d1.columns = ["합계" if c == "합계" else C.m_label(c) for c in d1.columns]
+        sections.append((f"{metric}{suffix} · 제휴사 × 월", style_values(d1, fmt_fn).to_html()))
+        if has_prev:
+            dp = df[df.year_tag == "prev"].copy()
+            dp["month"] = dp["month"].map(lambda s: C.m_shift(s, 1))
+            pm = C.value_matrix(dp, "affiliate", "month", metric, pay, order, months)
+            yy = C.yoy_matrix(m1, pm)
+            yy.columns = d1.columns
+            sections.append((f"{metric}{suffix} · 제휴사 × 월 (전년비 %)", style_yoy(yy).to_html()))
+
+        # 전체 제휴사 · 일자 × 월 (일자별 흐름)
+        m3 = C.value_matrix(cur_all, "day", "month", metric, pay, sorted(cur_all.day.unique()), months)
+        d3 = m3.copy()
+        d3.index = ["합계" if i == "합계" else f"{int(i)}일" for i in d3.index]
+        d3.columns = ["합계" if c == "합계" else C.m_label(c) for c in d3.columns]
+        sections.append((f"{metric}{suffix} · 전체 일자 × 월", style_values(d3, fmt_fn).to_html()))
+
+    body = "\n".join(f"<h2>{_h.escape(t)}</h2>{h}" for t, h in sections)
     return (
         '<!doctype html><html lang="ko"><head><meta charset="utf-8">'
         "<title>LF몰 제휴 일자별 실적 집계</title><style>"
@@ -132,8 +141,8 @@ def build_html(df, cur_all, metric, pay, has_prev, fmt_fn, asof) -> str:
         "td,th{border:1px solid #e5e7eb;padding:3px 7px;text-align:right;white-space:nowrap}"
         ".cap{color:#6b7280;font-size:.8rem}</style></head><body>"
         "<h1>🗓️ LF몰 제휴 일자별 실적 집계</h1>"
-        f'<div class="cap">지표: {_h.escape(metric)} · {pay_l} · 기준 {_h.escape(asof or "-")} '
-        "· 전년비 상승 ▼(초록)/하락 △(빨강)</div>"
+        f'<div class="cap">지표: UV · 인증자수 · 당월인증거래액(총결제) · 기준 {_h.escape(asof or "-")} '
+        "· 전년비 상승 ▼(초록)/하락 △(빨강) · 제휴사 리스팅은 UV·당월인증거래액 합계 0 제외</div>"
         f"{body}"
         '<div class="cap" style="margin-top:1.6rem">※ (날짜×제휴사) 집계 기반 · 세그·목표비 제외 · 개인정보 없음</div>'
         "</body></html>"
@@ -187,12 +196,12 @@ with st.sidebar:
 with st.sidebar:
     st.header("내보내기")
     try:
-        _report = build_html(df, cur_all, metric, pay, has_prev, fmt_fn, _asof)
+        _report = build_html(df, cur_all, has_prev, _asof)
         st.download_button(
             "⬇️ HTML 내보내기", data=_report.encode("utf-8"),
             file_name=f"lf_daily_{(_asof or 'export').replace('-', '')}.html",
             mime="text/html", use_container_width=True,
-            help="현재 지표·결제구분 기준 주요 표(제휴사×월+전년비, 날짜×제휴사 최근월, "
+            help="Total 코멘트 + UV·인증자수·당월인증거래액(총결제) 리포트(제휴사×월+전년비, "
                  "전체 일자×월)를 정적 HTML 1개로. 앱 없이 열람·공유 가능.")
     except Exception as _he:
         st.caption(f"⚠️ HTML 생성 오류: {_he}")
