@@ -39,6 +39,15 @@ def zero_perf_affiliates(cur_df) -> list:
     return [a for a in s.index if float(s.get(a, 0) or 0) == 0]
 
 
+# 금액 포맷은 원단위(콤마)로 — pivot_core.fmt_won의 억/만 축약 대신 여기(항상 새로 실행되는
+# 메인)에서 오버라이드해, 재배포 모듈 캐시와 무관하게 즉시 반영되게 한다.
+def fmt_won_full(v):
+    return "" if C.na(v) else f"{float(v):,.0f}"
+
+
+FMT = {"int": C.fmt_int, "won": fmt_won_full, "won0": C.fmt_int}
+
+
 # ── 스타일 ──────────────────────────────────────────────
 def style_values(mat, fmt_fn):
     return (mat.style
@@ -84,7 +93,7 @@ def _wd_html(p):
 def comment_html(res: dict) -> str:
     parts = []
     for metric, v in res["metrics"].items():
-        fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
+        fmt_fn = FMT[C.METRICS[metric]["fmt"]]
         parts.append(
             f'<div style="margin:.15rem 0"><b>{metric}</b> {fmt_fn(v["cur"])} '
             f'&nbsp;·&nbsp; {_yoy_html(v["yoy"])} &nbsp;·&nbsp; {_wd_html(v["wd_dev"])}</div>'
@@ -119,7 +128,7 @@ def build_html(df, cur_all, has_prev, asof) -> str:
 
     # 지표별: 당월인증거래액은 총결제(tot), UV·인증자수는 결제구분 무관(net)
     for metric, pay in [("UV", "net"), ("인증자수", "net"), ("당월인증거래액", "tot")]:
-        fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
+        fmt_fn = FMT[C.METRICS[metric]["fmt"]]
         suffix = " (총결제)" if metric == "당월인증거래액" else ""
         order = list(C.agg_value(cur_all, "affiliate", metric, pay)
                      .sort_values(ascending=False).index)
@@ -245,7 +254,7 @@ with st.sidebar:
                             help="거래액·고객수·객단가에만 적용(UV·인증자수는 무관)") == "순결제" else "tot"
     show_yoy = st.checkbox("전년비 %로 보기", value=False, disabled=not has_prev,
                            help="켜면 값 대신 전년 동기 대비 증감률(▼초록/△빨강)로 표시")
-    fmt_fn = C.FMT[C.METRICS[metric]["fmt"]]
+    fmt_fn = FMT[C.METRICS[metric]["fmt"]]
 
 with st.sidebar:
     st.header("내보내기")
