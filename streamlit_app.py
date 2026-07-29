@@ -64,6 +64,28 @@ def fmt_won_full(v):
 
 FMT = {"int": C.fmt_int, "won": fmt_won_full, "won0": C.fmt_int}
 
+CUST_METRICS = ("고객수(당월인증)", "객단가(당월인증)")
+
+
+def cust_month_matrix(mc_year, pay, index_order, col_order):
+    """monthly_cust(한 연도)로 (제휴사×월) '월 순수고객수' 매트릭스 + 합계.
+    셀(제휴사×월)은 정확. 합계(행/열/모서리)는 월·제휴사 순수고객의 단순합이라
+    교차기간·교차제휴사 중복이 있을 수 있음(근사)."""
+    col = "cust_net" if pay == "net" else "cust_tot"
+    cols = ["합계"] + list(col_order)
+    if mc_year is None or mc_year.empty:
+        return pd.DataFrame(index=["합계"] + list(index_order), columns=cols, dtype=float)
+    piv = mc_year.pivot_table(index="affiliate", columns="month", values=col, aggfunc="sum") \
+                 .reindex(index=index_order, columns=col_order)
+    row_tot = mc_year.groupby("affiliate")[col].sum().reindex(index_order)
+    col_tot = mc_year.groupby("month")[col].sum().reindex(col_order)
+    grand = float(mc_year[col].sum())
+    body = piv.copy()
+    body.insert(0, "합계", row_tot)
+    top = pd.DataFrame([[grand] + [col_tot.get(c, np.nan) for c in col_order]],
+                       index=["합계"], columns=body.columns)
+    return pd.concat([top, body])
+
 
 # ── 스타일 ──────────────────────────────────────────────
 def style_values(mat, fmt_fn):
@@ -223,6 +245,11 @@ if df.empty or "cur" not in set(df.year_tag.unique()):
 _asof = payload.get("generated_mtd_end", "")
 st.sidebar.success(f"로드: {src}" + (f" · 기준 {_asof}" if _asof else ""))
 
+# (year_tag, month, affiliate) 월 순수고객수 — 있으면 월별 뷰의 고객수·객단가를 정확히 계산.
+# 없으면(구 v1 JSON) 일별 nunique 합으로 대체(월 순수고객 과다계상 가능).
+mc = pd.DataFrame(payload.get("monthly_cust", []))
+HAS_MC = not mc.empty
+
 # 표·합계에서 제외할 비리스팅 파트너. 기본값은 내보낸 JSON의 exclude_listing(비공개 앱에서 지정).
 # 위젯 상태 지속 문제(한 번 굳으면 이후 default 무시)를 피하려고, 데이터가 바뀌면
 # 세션 상태에 기본 제외목록을 강제 주입한 뒤 위젯을 key로 바인딩한다.
@@ -253,6 +280,8 @@ with st.sidebar:
     st.caption(" · ".join(_cap))
 if excl:
     df = df[~df.affiliate.isin(excl)]
+    if HAS_MC:
+        mc = mc[~mc.affiliate.isin(excl)]
 
 cur_all = df[df.year_tag == "cur"]
 has_prev = "prev" in set(df.year_tag.unique())
@@ -350,16 +379,47 @@ with tab_af:
 
 # ── 뷰2: 제휴사 × 월 ──
 with tab2:
-    idx_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
-                     .sort_values(ascending=False).index)
     col_order = sorted(cur_all.month.unique())
-    cur_mat = C.value_matrix(cur_all, "affiliate", "month", metric, pay, idx_order, col_order)
+    # 고객수·객단가는 월 순수고객수(monthly_cust)로 계산 — 일별 nunique 합의 월 과다계상 방지.
+    use_mc = metric in CUST_METRICS and HAS_MC
+    cust_col = "cust_net" if pay == "net" else "cust_tot"
+
+    def _mc_year(tag, shift=False):
+        m = mc[mc.year_tag == tag].copy()
+        if shift:
+            m["month"] = m["month"].map(lambda s: C.m_shift(s, 1))
+            m = m[m["month"].isin(col_order)]
+        return m
+
+    if use_mc:
+        mc_cur = _mc_year("cur")
+        idx_order = list(mc_cur.groupby("affiliate")[cust_col].sum().sort_values(ascending=False).index)
+        cust_cur = cust_month_matrix(mc_cur, pay, idx_order, col_order)
+        if metric == "고객수(당월인증)":
+            cur_mat = cust_cur
+        else:  # 객단가 = 당월인증거래액 / 월 순수고객수
+            amt_cur = C.value_matrix(cur_all, "affiliate", "month", "당월인증거래액", pay, idx_order, col_order)
+            cur_mat = amt_cur / cust_cur.replace(0, np.nan)
+    else:
+        idx_order = list(C.agg_value(cur_all, "affiliate", metric, pay)
+                         .sort_values(ascending=False).index)
+        cur_mat = C.value_matrix(cur_all, "affiliate", "month", metric, pay, idx_order, col_order)
     disp = cur_mat.copy()
     disp.columns = ["합계" if c == "합계" else C.m_label(c) for c in disp.columns]
-    st.markdown(f"**{metric}** · 행=제휴사 / 열=월 ({'순결제' if pay=='net' else '총결제'} 기준)")
+    _note = " · 고객수=월 순수고객(합계는 단순합·중복가능)" if use_mc else ""
+    st.markdown(f"**{metric}** · 행=제휴사 / 열=월 ({'순결제' if pay=='net' else '총결제'} 기준){_note}")
     if show_yoy and has_prev:
-        dprev = prev_matched(df, col_order, _asof)
-        prev_mat = C.value_matrix(dprev, "affiliate", "month", metric, pay, idx_order, col_order)
+        if use_mc:
+            cust_prev = cust_month_matrix(_mc_year("prev", shift=True), pay, idx_order, col_order)
+            if metric == "고객수(당월인증)":
+                prev_mat = cust_prev
+            else:
+                amt_prev = C.value_matrix(prev_matched(df, col_order, _asof), "affiliate", "month",
+                                          "당월인증거래액", pay, idx_order, col_order)
+                prev_mat = amt_prev / cust_prev.replace(0, np.nan)
+        else:
+            dprev = prev_matched(df, col_order, _asof)
+            prev_mat = C.value_matrix(dprev, "affiliate", "month", metric, pay, idx_order, col_order)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.columns = disp.columns
         st.dataframe(style_yoy(yy), use_container_width=True, height=560)
