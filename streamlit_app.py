@@ -195,14 +195,28 @@ _asof = payload.get("generated_mtd_end", "")
 st.sidebar.success(f"로드: {src}" + (f" · 기준 {_asof}" if _asof else ""))
 
 # 표·합계에서 제외할 비리스팅 파트너. 기본값은 내보낸 JSON의 exclude_listing(비공개 앱에서 지정).
+# 위젯 상태 지속 문제(한 번 굳으면 이후 default 무시)를 피하려고, 데이터가 바뀌면
+# 세션 상태에 기본 제외목록을 강제 주입한 뒤 위젯을 key로 바인딩한다.
 _avail_af = sorted(df.affiliate.unique())
+_excl_listing = payload.get("exclude_listing", []) or []
+_excl_default = [a for a in _excl_listing if a in _avail_af]
+_excl_sig = f"{_asof}|{len(df)}|{len(_avail_af)}"
+if st.session_state.get("_excl_sig") != _excl_sig:
+    st.session_state["_excl_sig"] = _excl_sig
+    st.session_state["excl_ms"] = _excl_default
 with st.sidebar:
     st.header("제외 제휴사")
     excl = st.multiselect(
-        "리스팅 제외", _avail_af,
-        default=[a for a in payload.get("exclude_listing", []) if a in _avail_af],
-        help="선택한 제휴사를 UV·인증자수·당월인증거래액 등 모든 표·합계에서 제외(비리스팅 파트너). "
-             "기본값은 내보낸 JSON에 지정된 목록.")
+        "리스팅 제외", _avail_af, key="excl_ms",
+        help="선택 제휴사를 UV·인증자수·당월인증거래액 등 모든 표·합계에서 제외(비리스팅 파트너). "
+             "기본값은 내보낸 JSON의 exclude_listing.")
+    if _excl_listing:
+        _miss = [a for a in _excl_listing if a not in _avail_af]
+        st.caption(f"기본 제외목록 {len(_excl_listing)}개 인식"
+                   + (f" · 데이터에 없어 미적용: {', '.join(_miss)}" if _miss else " · 전부 적용됨"))
+    else:
+        st.caption("⚠️ 이 JSON엔 기본 제외목록이 없어요 — kimhyemin에서 **재내보내기** 후 "
+                   "업로드하면 자동 선택됩니다. (지금은 위에서 직접 선택 가능)")
 if excl:
     df = df[~df.affiliate.isin(excl)]
 
