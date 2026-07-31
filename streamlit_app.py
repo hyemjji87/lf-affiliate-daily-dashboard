@@ -129,6 +129,40 @@ def _wd_html(p):
     return "동요일평균 대비 " + _cspan(f"{'▼' if p >= 0 else '△'} {p:+.1f}%", p >= 0)
 
 
+def _pct1(v):
+    return "–" if v is None else f"{v:.1f}%"
+
+
+def _returns_html(r: dict) -> str:
+    """당월인증거래액 총결제·순결제 대조 + 취소·환불(취반품) 요약 한 줄."""
+    if r is None or (C.na(r.get("net_cur")) and C.na(r.get("tot_cur"))):
+        return ""
+    tot, net = fmt_won_full(r["tot_cur"]), fmt_won_full(r["net_cur"])
+    seg = (f'<b>당월인증거래액 총/순 대조</b> 총결제 {tot} '
+           f'({_yoy_html(r["tot_yoy"])}) &nbsp;·&nbsp; 순결제 {net} ({_yoy_html(r["net_yoy"])})')
+    if not C.na(r.get("cancel_cur")):
+        cr = r.get("cancel_ratio_cur")
+        crp = r.get("cancel_ratio_prev")
+        crtxt = f"취소율 {_pct1(cr * 100 if cr is not None else None)}"
+        if crp is not None:
+            crtxt += f" (전년 {_pct1(crp * 100)})"
+        seg += f' &nbsp;·&nbsp; 취소·환불 {fmt_won_full(r["cancel_cur"])} · {crtxt}'
+    return f'<div style="margin:.15rem 0;color:#374151">↳ {seg}</div>'
+
+
+def _lfshare_html(ls: dict) -> str:
+    """LF몰 전체거래액 대비 순결제 당월인증거래액 비중 한 줄(순결제일 때만 의미)."""
+    if ls is None or ls.get("share_cur") is None:
+        return ""
+    body = f'<b>LF몰 대비 비중</b> {_pct1(ls["share_cur"])}'
+    if ls.get("share_prev") is not None:
+        body += f' &nbsp;·&nbsp; 전년 {_pct1(ls["share_prev"])}'
+        dpp = ls.get("dpp")
+        if dpp is not None:
+            body += " &nbsp;·&nbsp; " + _cspan(f"{'▼' if dpp >= 0 else '△'} {dpp:+.2f}%p", dpp >= 0)
+    return f'<div style="margin:.15rem 0;color:#374151">↳ {body} <span style="color:#9ca3af">(순결제·당월인증거래액 기준)</span></div>'
+
+
 def comment_html(res: dict) -> str:
     parts = []
     for metric, v in res["metrics"].items():
@@ -137,8 +171,12 @@ def comment_html(res: dict) -> str:
             f'<div style="margin:.15rem 0"><b>{metric}</b> {fmt_fn(v["cur"])} '
             f'&nbsp;·&nbsp; {_yoy_html(v["yoy"])} &nbsp;·&nbsp; {_wd_html(v["wd_dev"])}</div>'
         )
+        # 당월인증거래액 바로 아래에 총/순 대조·LF몰 비중을 붙여 맥락을 준다.
+        if metric == "당월인증거래액":
+            parts.append(_returns_html(res.get("returns")))
+            parts.append(_lfshare_html(res.get("lf_share")))
     html = "".join(parts)
-    icon = {"uv_spike": "🔎", "cert_vs_total": "⚖️", "wd_dev": "📌"}
+    icon = {"uv_spike": "🔎", "cert_vs_total": "⚖️", "cancel": "🔁", "wd_dev": "📌"}
     if res["flags"]:
         html += ('<div style="margin-top:.5rem;padding:.5rem .7rem;background:#f9fafb;'
                  'border-left:3px solid #6366f1;border-radius:4px">')
@@ -150,20 +188,22 @@ def comment_html(res: dict) -> str:
     return html
 
 
-def build_html(df, cur_all, has_prev, asof) -> str:
+def build_html(df, cur_all, has_prev, asof, pay="net", lfmall_daily=None) -> str:
     """UV·인증자수·당월인증거래액(총결제) 리포트를 정적 HTML 1개로. Total 코멘트 포함.
-    각 지표 표는 그 지표 합계가 0인 제휴사를 리스팅에서 제외한다."""
+    각 지표 표는 그 지표 합계가 0인 제휴사를 리스팅에서 제외한다.
+    Total 코멘트는 사이드바 결제구분(pay)을 그대로 따르고, 총/순 대조·LF몰 비중을 함께 담는다."""
     import html as _h
     months = sorted(cur_all.month.unique())
     asof_day = int(asof[8:10]) if len(asof) >= 10 and asof[8:10].isdigit() else None
     hl = f"{asof_day}일" if asof_day else None  # 일자 매트릭스 분석일자 강조 라벨
+    pay_label = "순결제" if pay == "net" else "총결제"
 
     sections = []
 
-    # 0) Total 코멘트 (최근 분석일 · 전체 · 총결제)
+    # 0) Total 코멘트 (최근 분석일 · 전체 · 사이드바 결제구분)
     last_date = max(cur_all.date)
-    res = C.analyze_day(df, last_date, "전체", "tot")
-    sections.append((f"📌 Total 코멘트 · {last_date} · 전체 · 총결제", comment_html(res)))
+    res = C.analyze_day(df, last_date, "전체", pay, lfmall_daily)
+    sections.append((f"📌 Total 코멘트 · {last_date} · 전체 · {pay_label}", comment_html(res)))
 
     # 지표별: 당월인증거래액은 총결제(tot), UV·인증자수는 결제구분 무관(net)
     for metric, pay in [("UV", "net"), ("인증자수", "net"), ("당월인증거래액", "tot")]:
@@ -250,6 +290,10 @@ st.sidebar.success(f"로드: {src}" + (f" · 기준 {_asof}" if _asof else ""))
 mc = pd.DataFrame(payload.get("monthly_cust", []))
 HAS_MC = not mc.empty
 
+# 일자별 LF몰 전체거래액 {date: 원}. 있으면 분석일 코멘트에 LF몰 대비 비중을 표시.
+# 없으면(구 JSON) 비중 줄은 자동 생략 — kimhyemin 재내보내기 필요.
+LFMALL_DAILY = payload.get("lfmall_daily", {}) or {}
+
 # 표·합계에서 제외할 비리스팅 파트너. 기본값은 내보낸 JSON의 exclude_listing(비공개 앱에서 지정).
 # 위젯 상태 지속 문제(한 번 굳으면 이후 default 무시)를 피하려고, 데이터가 바뀌면
 # 세션 상태에 기본 제외목록을 강제 주입한 뒤 위젯을 key로 바인딩한다.
@@ -304,7 +348,7 @@ with st.sidebar:
 with st.sidebar:
     st.header("내보내기")
     try:
-        _report = build_html(df, cur_all, has_prev, _asof)
+        _report = build_html(df, cur_all, has_prev, _asof, pay, LFMALL_DAILY)
         st.download_button(
             "⬇️ HTML 내보내기", data=_report.encode("utf-8"),
             file_name=f"lf_daily_{(_asof or 'export').replace('-', '')}.html",
@@ -377,6 +421,24 @@ with tab_af:
     st.caption("한 제휴사의 여러 달 일자별 흐름을 나란히 비교(예: 삼성카드 5·6·7월 UV). "
                "전년비 토글 시 각 셀=전년 동일 캘린더일 대비.")
 
+    # 옵션 라인차트 — x=일 / 라인=월. 시리즈가 '월'뿐이라 겹쳐 보기 좋음(표는 그대로 원본).
+    # 값 모드에서만 노출(전년비 %는 표가 더 읽기 쉬움).
+    if not (show_yoy and has_prev):
+        with st.expander("📈 일자 추이 차트 (x=일 / 라인=월)", expanded=False):
+            chart_piv = C.pivot_values(d, "day", "month", metric, pay)
+            if chart_piv is None or chart_piv.empty:
+                st.caption("표시할 데이터가 없습니다.")
+            else:
+                chart_piv = chart_piv.reindex(index=idx_order, columns=sel_ms)
+                chart_piv.columns = [C.m_label(c) for c in chart_piv.columns]
+                chart_piv.index = [int(i) for i in chart_piv.index]
+                chart_piv.index.name = "일"
+                st.line_chart(chart_piv)
+                st.caption(f"{af} · {metric}({'순결제' if pay=='net' else '총결제'}) · "
+                           "x=일 / 라인=월 · 값 기준(전년비% 모드에선 숨김)")
+                if len(sel_ms) >= 5:
+                    st.caption("⚠️ 선택 월이 많아 라인이 겹칩니다 — 월을 3~4개로 줄이면 더 잘 보입니다.")
+
 # ── 뷰2: 제휴사 × 월 ──
 with tab2:
     col_order = sorted(cur_all.month.unique())
@@ -437,6 +499,8 @@ with tab3:
                                .sort_values(ascending=False).index)
         aff_sel = st.selectbox("제휴사", affs, index=0)
     st.markdown(f"#### {day_date} · {aff_sel} · {'순결제' if pay=='net' else '총결제'}")
-    res = C.analyze_day(df, day_date, aff_sel, pay)
+    res = C.analyze_day(df, day_date, aff_sel, pay, LFMALL_DAILY)
     st.markdown(comment_html(res), unsafe_allow_html=True)
-    st.caption("전년비=전년 동일 캘린더일 · 동요일평균=같은 달 내 같은 요일 평균(전일비 아님) · 세그·목표비 제외")
+    _lf_note = "" if LFMALL_DAILY else " · LF몰 비중은 JSON에 LF몰 일자별 거래액이 있어야 표시(kimhyemin 재내보내기)"
+    st.caption("전년비=전년 동일 캘린더일 · 동요일평균=같은 달 내 같은 요일 평균(전일비 아님) · "
+               "총/순 대조로 취반품 영향 판별 · 세그·목표비 제외" + _lf_note)
