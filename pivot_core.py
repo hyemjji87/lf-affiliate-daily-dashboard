@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 # 지표 정의 — base: 합산 가능한 원천 컬럼(pay별). aov = 당월인증거래액/당월인증 고객수.
+# ratio = num/den(합계·전년비는 sum(num)/sum(den)으로 가중). 인증률 = 인증자수/UV(방문→인증 전환율).
 METRICS = {
     "UV":               {"kind": "base", "net": "uv",           "tot": "uv",           "pay": False, "fmt": "int"},
     "인증자수":          {"kind": "base", "net": "cert_total",   "tot": "cert_total",   "pay": False, "fmt": "int"},
@@ -18,6 +19,7 @@ METRICS = {
     "전체거래액":        {"kind": "base", "net": "all_amt_net",  "tot": "all_amt_tot",  "pay": True,  "fmt": "won"},
     "고객수(당월인증)":   {"kind": "base", "net": "cust_net",     "tot": "cust_tot",     "pay": True,  "fmt": "int"},
     "객단가(당월인증)":   {"kind": "aov",                                                "pay": True,  "fmt": "won0"},
+    "인증률":           {"kind": "ratio", "num": "cert_total",   "den": "uv",           "pay": False, "fmt": "pct"},
 }
 KEY_METRICS_FOR_COMMENT = ["UV", "인증자수", "당월인증거래액", "전체거래액", "객단가(당월인증)"]
 
@@ -42,7 +44,11 @@ def fmt_won(v):
     return f"{v:,.0f}"
 
 
-FMT = {"int": fmt_int, "won": fmt_won, "won0": fmt_int}
+def fmt_pct(v):
+    return "" if na(v) else f"{float(v) * 100:.1f}%"
+
+
+FMT = {"int": fmt_int, "won": fmt_won, "won0": fmt_int, "pct": fmt_pct}
 
 
 def m_shift(mlabel: str, k: int) -> str:
@@ -77,8 +83,8 @@ def base_col(metric, pay):
 def agg_value(d, by, metric, pay):
     """by=None → 스칼라 총계, by=컬럼명 → 그 축 Series. 객단가는 sum(거래액)/sum(고객수)."""
     m = METRICS[metric]
-    if m["kind"] == "aov":
-        an, cn = f"cert_amt_{pay}", f"cust_{pay}"
+    if m["kind"] in ("aov", "ratio"):
+        an, cn = (f"cert_amt_{pay}", f"cust_{pay}") if m["kind"] == "aov" else (m["num"], m["den"])
         if by is None:
             den = d[cn].sum()
             return (d[an].sum() / den) if den else np.nan
@@ -93,9 +99,10 @@ def pivot_values(d, index, columns, metric, pay):
     if d.empty:
         return pd.DataFrame()
     m = METRICS[metric]
-    if m["kind"] == "aov":
-        num = d.pivot_table(index=index, columns=columns, values=f"cert_amt_{pay}", aggfunc="sum")
-        den = d.pivot_table(index=index, columns=columns, values=f"cust_{pay}", aggfunc="sum")
+    if m["kind"] in ("aov", "ratio"):
+        vn, vd = (f"cert_amt_{pay}", f"cust_{pay}") if m["kind"] == "aov" else (m["num"], m["den"])
+        num = d.pivot_table(index=index, columns=columns, values=vn, aggfunc="sum")
+        den = d.pivot_table(index=index, columns=columns, values=vd, aggfunc="sum")
         return num.div(den.replace(0, np.nan))
     return d.pivot_table(index=index, columns=columns, values=base_col(metric, pay), aggfunc="sum")
 
