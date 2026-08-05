@@ -62,7 +62,13 @@ def fmt_won_full(v):
     return "" if C.na(v) else f"{float(v):,.0f}"
 
 
-FMT = {"int": C.fmt_int, "won": fmt_won_full, "won0": C.fmt_int, "pct": C.fmt_pct}
+# 인증률(%) 포맷도 여기(메인)에서 로컬 정의 — 재배포 시 pivot_core가 옛 캐시로 남아
+# C.fmt_pct를 못 찾고 import 단계에서 앱 전체가 죽던 문제 회피(fmt_won_full과 동일 패턴).
+def fmt_pct(v):
+    return "" if C.na(v) else f"{float(v) * 100:.1f}%"
+
+
+FMT = {"int": C.fmt_int, "won": fmt_won_full, "won0": C.fmt_int, "pct": fmt_pct}
 
 CUST_METRICS = ("고객수(당월인증)", "객단가(당월인증)")
 
