@@ -93,10 +93,33 @@ def cust_month_matrix(mc_year, pay, index_order, col_order):
     return pd.concat([top, body])
 
 
+# ── LF몰 대비 비중 (일자 매트릭스 전용 열) ──────────────────────
+# 지표가 거래액(당월인증/전체)일 때, 행=일 표의 '일'과 '합계' 사이에 넣는다.
+# 분모는 JSON의 일자별 LF몰 전체거래액(순결제=lfmall_daily / 총결제=lfmall_daily_tot).
+LF_SHARE_METRICS = ("당월인증거래액", "전체거래액")
+
+
+def fmt_share(v):
+    return "" if C.na(v) else f"{float(v):.1f}%"
+
+
+def lf_share_series(mat, day_dates: dict, lf_map: dict) -> pd.Series:
+    """행=일(+'합계') 매트릭스의 행별 'LF몰 비중'(%) — 분자=행 합계(표시 중인 범위 합),
+    분모=같은 일자(들)의 LF몰 전체거래액 합. 분모 없는 날은 빈칸(NaN)."""
+    def share(num, dates):
+        den = sum(lf_map[x] for x in dates if x in lf_map)
+        return (float(num) / den * 100) if (den and not C.na(num)) else np.nan
+    all_dates = [x for ds in day_dates.values() for x in ds]
+    return pd.Series([share(mat.loc[i, "합계"],
+                            all_dates if i == "합계" else day_dates.get(int(i), []))
+                      for i in mat.index], index=mat.index, dtype=float)
+
+
 # ── 스타일 ──────────────────────────────────────────────
-def style_values(mat, fmt_fn):
+def style_values(mat, fmt_fn, fmt_overrides=None):
+    fmt = {c: fmt_overrides.get(c, fmt_fn) for c in mat.columns} if fmt_overrides else fmt_fn
     return (mat.style
-            .format(fmt_fn, na_rep="")
+            .format(fmt, na_rep="")
             .apply(lambda s: ["font-weight:700" if s.name == "합계" else "" for _ in s], axis=1)
             .set_properties(subset=["합계"], **{"font-weight": "700"}))
 
@@ -296,9 +319,10 @@ st.sidebar.success(f"로드: {src}" + (f" · 기준 {_asof}" if _asof else ""))
 mc = pd.DataFrame(payload.get("monthly_cust", []))
 HAS_MC = not mc.empty
 
-# 일자별 LF몰 전체거래액 {date: 원}. 있으면 분석일 코멘트에 LF몰 대비 비중을 표시.
-# 없으면(구 JSON) 비중 줄은 자동 생략 — kimhyemin 재내보내기 필요.
+# 일자별 LF몰 전체거래액 {date: 원}. 있으면 분석일 코멘트·일자 매트릭스에 LF몰 대비 비중을 표시.
+# 없으면(구 JSON) 비중은 자동 생략 — kimhyemin 재내보내기 필요. tot(총결제)는 v3 후반부터.
 LFMALL_DAILY = payload.get("lfmall_daily", {}) or {}
+LFMALL_DAILY_TOT = payload.get("lfmall_daily_tot", {}) or {}
 
 # 표·합계에서 제외할 비리스팅 파트너. 기본값은 내보낸 JSON의 exclude_listing(비공개 앱에서 지정).
 # 위젯 상태 지속 문제(한 번 굳으면 이후 default 무시)를 피하려고, 데이터가 바뀌면
@@ -388,7 +412,18 @@ with tab1:
         yy.index = disp.index
         st.dataframe(_hl_row(style_yoy(yy), HL_LABEL), use_container_width=True, height=560)
     else:
-        st.dataframe(_hl_row(style_values(disp, fmt_fn), HL_LABEL), use_container_width=True, height=560)
+        _lf_map = LFMALL_DAILY_TOT if pay == "tot" else LFMALL_DAILY
+        _has_share = metric in LF_SHARE_METRICS and bool(_lf_map)
+        if _has_share:
+            _dd = {int(k): list(v) for k, v in dcur.groupby("day")["date"].unique().items()}
+            disp.insert(0, "LF몰 비중", lf_share_series(cur_mat, _dd, _lf_map).tolist())
+        st.dataframe(_hl_row(style_values(disp, fmt_fn,
+                                          {"LF몰 비중": fmt_share} if _has_share else None), HL_LABEL),
+                     use_container_width=True, height=560)
+        if _has_share:
+            st.caption("LF몰 비중 = 표시 제휴사 합계 ÷ 같은 일자 LF몰 전체거래액 × 100 (합계 행=월 누적)")
+        elif metric in LF_SHARE_METRICS and pay == "tot" and LFMALL_DAILY:
+            st.caption("※ 총결제 기준 LF몰 비중은 JSON에 총결제 분모가 없어 생략 — 본 대시보드에서 재내보내기하면 표시됩니다.")
 
 # ── 뷰: 제휴사 · 일자 × 월 (한 제휴사 필터 + 월 다중선택) ──
 with tab_af:
@@ -423,7 +458,16 @@ with tab_af:
         yy.index, yy.columns = disp.index, disp.columns
         st.dataframe(_hl_row(style_yoy(yy), HL_LABEL), use_container_width=True, height=620)
     else:
-        st.dataframe(_hl_row(style_values(disp, fmt_fn), HL_LABEL), use_container_width=True, height=620)
+        _lf_map = LFMALL_DAILY_TOT if pay == "tot" else LFMALL_DAILY
+        _has_share = metric in LF_SHARE_METRICS and bool(_lf_map)
+        if _has_share:
+            _dd = {int(k): list(v) for k, v in d.groupby("day")["date"].unique().items()}
+            disp.insert(0, "LF몰 비중", lf_share_series(cur_mat, _dd, _lf_map).tolist())
+        st.dataframe(_hl_row(style_values(disp, fmt_fn,
+                                          {"LF몰 비중": fmt_share} if _has_share else None), HL_LABEL),
+                     use_container_width=True, height=620)
+        if _has_share:
+            st.caption(f"LF몰 비중 = {af} {metric} 합계 ÷ 같은 일자 LF몰 전체거래액 × 100 (합계 행=선택 월 누적)")
     st.caption("한 제휴사의 여러 달 일자별 흐름을 나란히 비교(예: 삼성카드 5·6·7월 UV). "
                "전년비 토글 시 각 셀=전년 동일 캘린더일 대비.")
 
