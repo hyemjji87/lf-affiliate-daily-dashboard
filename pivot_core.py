@@ -12,8 +12,10 @@ import pandas as pd
 
 # 지표 정의 — base: 합산 가능한 원천 컬럼(pay별). aov = 당월인증거래액/당월인증 고객수.
 # ratio = num/den(합계·전년비는 sum(num)/sum(den)으로 가중). 인증률 = 인증자수/UV(방문→인증 전환율).
+# 가입자수 = 유입실적 '★가입회원'의 합(결제구분 무관) — 원천에 그 컬럼이 있는 JSON에만 실린다.
 METRICS = {
     "UV":               {"kind": "base", "net": "uv",           "tot": "uv",           "pay": False, "fmt": "int"},
+    "가입자수":          {"kind": "base", "net": "signup",       "tot": "signup",       "pay": False, "fmt": "int"},
     "인증자수":          {"kind": "base", "net": "cert_total",   "tot": "cert_total",   "pay": False, "fmt": "int"},
     "당월인증거래액":     {"kind": "base", "net": "cert_amt_net", "tot": "cert_amt_tot", "pay": True,  "fmt": "won"},
     "전체거래액":        {"kind": "base", "net": "all_amt_net",  "tot": "all_amt_tot",  "pay": True,  "fmt": "won"},

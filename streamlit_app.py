@@ -73,6 +73,29 @@ FMT = {"int": C.fmt_int, "won": fmt_won_full, "won0": C.fmt_int, "pct": fmt_pct}
 CUST_METRICS = ("고객수(당월인증)", "객단가(당월인증)")
 
 
+def metric_source_cols(metric) -> list:
+    """그 지표를 계산하는 데 필요한 원천 컬럼들."""
+    m = C.METRICS[metric]
+    if m["kind"] == "aov":
+        return ["cert_amt_net", "cert_amt_tot", "cust_net", "cust_tot"]
+    if m["kind"] == "ratio":
+        return [m["num"], m["den"]]
+    return [m["net"], m["tot"]]
+
+
+def usable_metrics(df, signup_yrs=None) -> list:
+    """이 JSON으로 실제 계산되는 지표만 (구 JSON에는 없는 컬럼이 있다).
+    가입자수는 원천 유입실적에 '★가입회원'이 있어야 실리므로, 당년에 없으면 목록에서 뺀다
+    — 없는 지표를 0으로 그리지 않기 위함.
+    ※ pivot_core가 아닌 여기(항상 새로 실행되는 메인)에 정의 — 재배포 시 모듈 캐시로
+    새 함수를 못 찾아 앱이 죽던 문제 회피(fmt_won_full·zero_perf_affiliates와 같은 패턴)."""
+    cols = set(df.columns)
+    out = [k for k in C.METRICS if all(c in cols for c in metric_source_cols(k))]
+    if signup_yrs is not None and "가입자수" in out and "cur" not in signup_yrs:
+        out.remove("가입자수")
+    return out
+
+
 def cust_month_matrix(mc_year, pay, index_order, col_order):
     """monthly_cust(한 연도)로 (제휴사×월) '월 순수고객수' 매트릭스 + 합계.
     셀(제휴사×월)은 정확. 합계(행/열/모서리)는 월·제휴사 순수고객의 단순합이라
@@ -324,6 +347,9 @@ HAS_MC = not mc.empty
 LFMALL_DAILY = payload.get("lfmall_daily", {}) or {}
 LFMALL_DAILY_TOT = payload.get("lfmall_daily_tot", {}) or {}
 
+# 가입자수(유입실적 '★가입회원')가 실린 연도. 구 JSON에는 키가 없어 None(=판정 불가)으로 둔다.
+SIGNUP_YEARS = payload.get("signup_years")
+
 # 표·합계에서 제외할 비리스팅 파트너. 기본값은 내보낸 JSON의 exclude_listing(비공개 앱에서 지정).
 # 위젯 상태 지속 문제(한 번 굳으면 이후 default 무시)를 피하려고, 데이터가 바뀌면
 # 세션 상태에 기본 제외목록을 강제 주입한 뒤 위젯을 key로 바인딩한다.
@@ -366,11 +392,18 @@ HL_LABEL = f"{_asof_day}일" if _asof_day else None
 
 with st.sidebar:
     st.header("지표")
-    metric = st.selectbox("지표 선택", list(C.METRICS.keys()), index=2)
+    _mopts = usable_metrics(df, SIGNUP_YEARS)
+    _mdef = _mopts.index("당월인증거래액") if "당월인증거래액" in _mopts else 0
+    metric = st.selectbox("지표 선택", _mopts, index=_mdef)
+    if "가입자수" in C.METRICS and "가입자수" not in _mopts:
+        st.caption("※ 가입자수는 이 JSON에 없습니다 — kimhyemin에서 피벗 JSON을 다시 내보내면 "
+                   "나타납니다(유입실적에 '★가입회원' 컬럼이 있어야 함).")
+    elif metric == "가입자수" and SIGNUP_YEARS is not None and "prev" not in SIGNUP_YEARS:
+        st.caption("※ 전년 데이터에 '★가입회원'이 없어 가입자수 전년비는 비워 둡니다(0으로 채우지 않음).")
     pay_on = C.METRICS[metric]["pay"]
     pay = "net" if st.radio("결제 구분", ["순결제", "총결제"], index=0, horizontal=True,
                             disabled=not pay_on,
-                            help="거래액·고객수·객단가에만 적용(UV·인증자수는 무관)") == "순결제" else "tot"
+                            help="거래액·고객수·객단가에만 적용(UV·가입자수·인증자수는 무관)") == "순결제" else "tot"
     show_yoy = st.checkbox("전년비 %로 보기", value=False, disabled=not has_prev,
                            help="켜면 값 대신 전년 동기 대비 증감률(▼초록/△빨강)로 표시")
     fmt_fn = FMT[C.METRICS[metric]["fmt"]]
