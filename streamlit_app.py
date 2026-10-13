@@ -157,6 +157,36 @@ def style_yoy(mat):
     return mat.style.format(f, na_rep="").map(color)
 
 
+def grid(styler, data, fmt_fn, key, height, col_fmts=None, yoy=False):
+    """st.dataframe + 셀 드래그 선택 시 합계·평균·최소·최대 표시(엑셀 상태표시줄처럼).
+    값은 표시 문자열이 아니라 원본 숫자(data)에서 계산. 전년비 %는 합계가 무의미해 생략."""
+    ev = st.dataframe(styler, use_container_width=True, height=height,
+                      on_select="rerun", selection_mode="multi-cell", key=key)
+    cells = getattr(getattr(ev, "selection", None), "cells", None) or []
+    vals, cols = [], set()
+    for r, c in cells:
+        if c in data.columns and 0 <= r < len(data):
+            v = data.iloc[r][c]
+            if not C.na(v):
+                vals.append(float(v))
+                cols.add(c)
+    if not vals:
+        st.caption("숫자 셀을 드래그하면 합계·평균이 표시됩니다 (Shift+클릭으로 범위, Ctrl+클릭으로 추가)")
+        return
+    if yoy:
+        f = lambda v: f"{v:+.1f}%"
+    else:
+        f = fmt_fn
+        if col_fmts and len(cols) == 1 and next(iter(cols)) in col_fmts:
+            f = col_fmts[next(iter(cols))]
+    a = np.array(vals)
+    parts = [f"**{len(a)}칸**"]
+    if not yoy:
+        parts.append(f"합계 **{f(a.sum())}**")
+    parts += [f"평균 **{f(a.mean())}**", f"최소 {f(a.min())}", f"최대 {f(a.max())}"]
+    st.markdown(" · ".join(parts))
+
+
 def _hl_row(styler, label):
     """일자 매트릭스에서 분석일자('N일') 행을 배경색으로 강조."""
     if not label:
@@ -443,16 +473,16 @@ with tab1:
         prev_mat = C.value_matrix(dprev, "day", "affiliate", metric, pay, idx_order, col_order)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.index = disp.index
-        st.dataframe(_hl_row(style_yoy(yy), HL_LABEL), use_container_width=True, height=560)
+        grid(_hl_row(style_yoy(yy), HL_LABEL), yy, fmt_fn, f"g1y_{sel_m}_{metric}_{pay}", 560, yoy=True)
     else:
         _lf_map = LFMALL_DAILY_TOT if pay == "tot" else LFMALL_DAILY
         _has_share = metric in LF_SHARE_METRICS and bool(_lf_map)
         if _has_share:
             _dd = {int(k): list(v) for k, v in dcur.groupby("day")["date"].unique().items()}
             disp.insert(0, "LF몰 비중", lf_share_series(cur_mat, _dd, _lf_map).tolist())
-        st.dataframe(_hl_row(style_values(disp, fmt_fn,
-                                          {"LF몰 비중": fmt_share} if _has_share else None), HL_LABEL),
-                     use_container_width=True, height=560)
+        grid(_hl_row(style_values(disp, fmt_fn,
+                                   {"LF몰 비중": fmt_share} if _has_share else None), HL_LABEL),
+             disp, fmt_fn, f"g1_{sel_m}_{metric}_{pay}", 560, {"LF몰 비중": fmt_share})
         if _has_share:
             st.caption("LF몰 비중 = 표시 제휴사 합계 ÷ 같은 일자 LF몰 전체거래액 × 100 (합계 행=월 누적)")
         elif metric in LF_SHARE_METRICS and pay == "tot" and LFMALL_DAILY:
@@ -489,16 +519,16 @@ with tab_af:
         prev_mat = C.value_matrix(dprev, "day", "month", metric, pay, idx_order, sel_ms)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.index, yy.columns = disp.index, disp.columns
-        st.dataframe(_hl_row(style_yoy(yy), HL_LABEL), use_container_width=True, height=620)
+        grid(_hl_row(style_yoy(yy), HL_LABEL), yy, fmt_fn, f"gay_{af}_{metric}_{pay}", 620, yoy=True)
     else:
         _lf_map = LFMALL_DAILY_TOT if pay == "tot" else LFMALL_DAILY
         _has_share = metric in LF_SHARE_METRICS and bool(_lf_map)
         if _has_share:
             _dd = {int(k): list(v) for k, v in d.groupby("day")["date"].unique().items()}
             disp.insert(0, "LF몰 비중", lf_share_series(cur_mat, _dd, _lf_map).tolist())
-        st.dataframe(_hl_row(style_values(disp, fmt_fn,
-                                          {"LF몰 비중": fmt_share} if _has_share else None), HL_LABEL),
-                     use_container_width=True, height=620)
+        grid(_hl_row(style_values(disp, fmt_fn,
+                                   {"LF몰 비중": fmt_share} if _has_share else None), HL_LABEL),
+             disp, fmt_fn, f"ga_{af}_{metric}_{pay}", 620, {"LF몰 비중": fmt_share})
         if _has_share:
             st.caption(f"LF몰 비중 = {af} {metric} 합계 ÷ 같은 일자 LF몰 전체거래액 × 100 (합계 행=선택 월 누적)")
     st.caption("한 제휴사의 여러 달 일자별 흐름을 나란히 비교(예: 삼성카드 5·6·7월 UV). "
@@ -567,9 +597,9 @@ with tab2:
             prev_mat = C.value_matrix(dprev, "affiliate", "month", metric, pay, idx_order, col_order)
         yy = C.yoy_matrix(cur_mat, prev_mat)
         yy.columns = disp.columns
-        st.dataframe(style_yoy(yy), use_container_width=True, height=560)
+        grid(style_yoy(yy), yy, fmt_fn, f"g2y_{metric}_{pay}", 560, yoy=True)
     else:
-        st.dataframe(style_values(disp, fmt_fn), use_container_width=True, height=560)
+        grid(style_values(disp, fmt_fn), disp, fmt_fn, f"g2_{metric}_{pay}", 560)
 
 # ── 뷰3: 분석일 코멘트 ──
 with tab3:
